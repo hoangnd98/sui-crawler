@@ -1,0 +1,40 @@
+.git
+.gitignore
+.dockerignore
+
+# Local agent/task notes are not needed in build contexts.
+.agent/
+CLAUDE.md
+
+# Environment and local secrets
+.env
+.env.*
+!.env.sample
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build and test artifacts
+sui-crawler
+crawler
+exporter
+bin/
+dist/
+build/
+*.test
+*.prof
+coverage.out
+
+# Caches and runtime output
+.cache/
+.gocache/
+result/
+progress.json
+test_progress.json
+*.log

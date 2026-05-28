@@ -1,0 +1,48 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment and local secrets
+.env
+.env.*
+!.env.sample
+
+# Go build and test artifacts
+/sui-crawler
+/crawler
+/exporter
+*.test
+*.prof
+coverage.out
+
+# Compiled binaries and shared libraries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build output
+/bin/
+/dist/
+/build/
+
+# Local caches
+/.cache/
+/.gocache/
+
+# Runtime output and scratch state
+/result/
+/progress.json
+/test_progress.json
+*.log
+
+# Local agent memory
+.agent/

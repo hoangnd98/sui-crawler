@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6
+    container_name: sui_crawler_mongodb
+    restart: unless-stopped
+    ports:
+      - "27019:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: sui_crawler_clickhouse
+    restart: unless-stopped
+    ports:
+      - "9000:9000" # Native TCP port
+      - "8123:8123" # HTTP port
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=password123
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  mongodb_data:
+  clickhouse_data:

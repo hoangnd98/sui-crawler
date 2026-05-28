@@ -1,0 +1,1630 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"math/rand"
+	"net/http"
+	"strings"
+	"time"
+
+	grpcsdk "github.com/open-move/sui-go-sdk/grpc"
+	"golang.org/x/time/rate"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
+
+	v2 "github.com/open-move/sui-go-sdk/proto/sui/rpc/v2"
+
+	"sui-crawler/internal/models"
+)
+
+const (
+	maxRetries                  = 5
+	initialBackoffMs            = 1000
+	maxBackoffMs                = 60000
+	defaultRPCTimeout           = 5 * time.Minute
+	publicBatchTxParallelism    = 10
+	nonPublicBatchTxParallelism = 1
+	checkpointBatchSize         = 10
+	checkpointDigestPageSize    = 50
+	maxCheckpointDigestPages    = 1000
+)
+
+type SuiClient struct {
+	grpcClient             *grpcsdk.Client
+	grpcEndpoint           string
+	rateLimiter            *rate.Limiter
+	graphQLRateLimiter     *rate.Limiter
+	rpcTimeout             time.Duration
+	grpcSemaphore          chan struct{}
+	batchTxSemaphore       chan struct{}
+	rpcHeaders             map[string]string
+	jsonRPCURL             string
+	graphQLURL             string
+	httpClient             *http.Client
+	gatewayTimeoutFallback *SuiClient
+}
+
+// NewSuiClient creates a new SUI gRPC client. limiter may be nil (no rate limiting).
+func NewSuiClient(ctx context.Context, endpoint string, limiter *rate.Limiter) (*SuiClient, error) {
+	return NewSuiClientWithHeaders(ctx, endpoint, limiter, nil)
+}
+
+// NewSuiClientWithHeaders creates a new SUI gRPC client with optional per-RPC headers.
+func NewSuiClientWithHeaders(ctx context.Context, endpoint string, limiter *rate.Limiter, headers map[string]string) (*SuiClient, error) {
+	if endpoint == "" {
+		endpoint = "https://archive.mainnet.sui.io:443"
+	}
+
+	opts := make([]grpcsdk.Option, 0, 1)
+	if len(headers) > 0 {
+		opts = append(opts, grpcsdk.WithDialOption(grpc.WithUnaryInterceptor(unaryMetadataInterceptor(headers))))
+	}
+
+	client, err := grpcsdk.NewClient(ctx, endpoint, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sui grpc client: %w", err)
+	}
+
+	return &SuiClient{
+		grpcClient:       client,
+		grpcEndpoint:     client.Endpoint(),
+		rateLimiter:      limiter,
+		rpcTimeout:       defaultRPCTimeout,
+		grpcSemaphore:    make(chan struct{}, 10),
+		batchTxSemaphore: make(chan struct{}, batchTxParallelism(headers)),
+		rpcHeaders:       cloneHeaders(headers),
+		jsonRPCURL:       "",
+		graphQLURL:       "https://graphql.mainnet.sui.io/graphql",
+		httpClient:       &http.Client{Timeout: 30 * time.Second},
+	}, nil
+}
+
+// SetRPCTimeout overrides the timeout applied to individual gRPC calls.
+func (c *SuiClient) SetRPCTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		c.rpcTimeout = timeout
+	}
+}
+
+// SetGatewayTimeoutFallback configures a secondary client used when the primary
+// gRPC endpoint returns an upstream 504 Gateway Timeout.
+func (c *SuiClient) SetGatewayTimeoutFallback(fallback *SuiClient) {
+	if fallback == nil || fallback == c {
+		return
+	}
+	c.gatewayTimeoutFallback = fallback
+}
+
+func unaryMetadataInterceptor(headers map[string]string) grpc.UnaryClientInterceptor {
+	md := metadata.New(headers)
+	return func(
+		ctx context.Context,
+		method string,
+		req any,
+		reply any,
+		cc *grpc.ClientConn,
+		invoker grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		return invoker(metadata.NewOutgoingContext(ctx, md), method, req, reply, cc, opts...)
+	}
+}
+
+func cloneHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(headers))
+	for k, v := range headers {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func batchTxParallelism(headers map[string]string) int {
+	if len(headers) > 0 && strings.TrimSpace(headers["x-token"]) != "" {
+		return nonPublicBatchTxParallelism
+	}
+	return publicBatchTxParallelism
+}
+
+func (c *SuiClient) fallbackClient() *SuiClient {
+	if c.gatewayTimeoutFallback == nil || c.gatewayTimeoutFallback == c {
+		return nil
+	}
+	return c.gatewayTimeoutFallback
+}
+
+func (c *SuiClient) rpcLabel(method, target string) string {
+	label := method
+	if target != "" {
+		label = fmt.Sprintf("%s(%s)", method, target)
+	}
+	if c.grpcEndpoint != "" {
+		label = fmt.Sprintf("%s endpoint=%s", label, c.grpcEndpoint)
+	}
+	if c.rpcTimeout > 0 {
+		label = fmt.Sprintf("%s timeout=%s", label, c.rpcTimeout)
+	}
+	return label
+}
+
+func (c *SuiClient) gatewayTimeoutFallbackLabel(method, target string) string {
+	label := method
+	if target != "" {
+		label = fmt.Sprintf("%s(%s)", method, target)
+	}
+	return label
+}
+
+// SetJSONRPCURL overrides the JSON-RPC endpoint used for event queries.
+func (c *SuiClient) SetJSONRPCURL(url string) {
+	if url != "" {
+		c.jsonRPCURL = url
+	}
+}
+
+// SetGraphQLURL overrides the GraphQL endpoint used for checkpoint batch queries.
+func (c *SuiClient) SetGraphQLURL(url string) {
+	if url != "" {
+		c.graphQLURL = url
+	}
+}
+
+// SetGraphQLRateLimiter configures a separate rate limiter for GraphQL HTTP requests.
+func (c *SuiClient) SetGraphQLRateLimiter(limiter *rate.Limiter) {
+	c.graphQLRateLimiter = limiter
+}
+
+func (c *SuiClient) rateWait(ctx context.Context) error {
+	if c.rateLimiter == nil {
+		return nil
+	}
+	return c.rateLimiter.Wait(ctx)
+}
+
+func (c *SuiClient) graphQLRateWait(ctx context.Context) error {
+	if c.graphQLRateLimiter == nil {
+		return nil
+	}
+	return c.graphQLRateLimiter.Wait(ctx)
+}
+
+func (c *SuiClient) acquireBatchTxSlot(ctx context.Context) error {
+	if c.batchTxSemaphore == nil {
+		return nil
+	}
+	select {
+	case c.batchTxSemaphore <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *SuiClient) releaseBatchTxSlot() {
+	if c.batchTxSemaphore == nil {
+		return
+	}
+	select {
+	case <-c.batchTxSemaphore:
+	default:
+	}
+}
+
+func (c *SuiClient) acquireGRPCSlot(ctx context.Context) error {
+	if c.grpcSemaphore == nil {
+		return nil
+	}
+	select {
+	case c.grpcSemaphore <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *SuiClient) releaseGRPCSlot() {
+	if c.grpcSemaphore == nil {
+		return
+	}
+	select {
+	case <-c.grpcSemaphore:
+	default:
+	}
+}
+
+// Close closes the underlying gRPC connection.
+func (c *SuiClient) Close() error {
+	return c.grpcClient.Close()
+}
+
+func (c *SuiClient) callWithGatewayTimeoutFallback(
+	ctx context.Context,
+	method string,
+	target string,
+	call func(client *SuiClient) error,
+) error {
+	err := call(c)
+	if err == nil || !isGatewayTimeoutError(err) {
+		return err
+	}
+
+	fallback := c.fallbackClient()
+	if fallback == nil {
+		return err
+	}
+
+	fmt.Printf(
+		"[%s] Gateway timeout on endpoint=%s; retrying via endpoint=%s: %v\n",
+		c.gatewayTimeoutFallbackLabel(method, target),
+		c.grpcEndpoint,
+		fallback.grpcEndpoint,
+		err,
+	)
+
+	if ctx.Err() != nil {
+		return err
+	}
+	return call(fallback)
+}
+
+func (c *SuiClient) callWithRetryAndFallback(
+	ctx context.Context,
+	method string,
+	target string,
+	call func(client *SuiClient) error,
+) error {
+	err := withRetryContext(ctx, c.rpcLabel(method, target), func() error {
+		return c.callWithGatewayTimeoutFallback(ctx, method, target, call)
+	})
+	if err == nil {
+		return nil
+	}
+
+	fallback := c.fallbackClient()
+	if fallback == nil || ctx.Err() != nil {
+		return err
+	}
+
+	fmt.Printf(
+		"[%s] Primary endpoint=%s exhausted retries; falling back to endpoint=%s: %v\n",
+		c.gatewayTimeoutFallbackLabel(method, target),
+		c.grpcEndpoint,
+		fallback.grpcEndpoint,
+		err,
+	)
+
+	return withRetryContext(ctx, fallback.rpcLabel(method, target), func() error {
+		return call(fallback)
+	})
+}
+
+// GetLatestCheckpointSequenceNumber fetches the latest checkpoint sequence number.
+func (c *SuiClient) GetLatestCheckpointSequenceNumber(ctx context.Context) (int64, error) {
+	var seq int64
+	err := c.callWithRetryAndFallback(ctx, "GetLatestCheckpoint", "", func(active *SuiClient) error {
+		req := &v2.GetCheckpointRequest{}
+		if err := active.acquireGRPCSlot(ctx); err != nil {
+			return err
+		}
+		defer active.releaseGRPCSlot()
+		rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
+		defer cancel()
+
+		resp, err := active.grpcClient.LedgerClient().GetCheckpoint(rpcCtx, req)
+		if err != nil {
+			return err
+		}
+		if resp.Checkpoint == nil || resp.Checkpoint.SequenceNumber == nil {
+			return fmt.Errorf("no sequence number in response")
+		}
+		seq = int64(*resp.Checkpoint.SequenceNumber)
+		return nil
+	})
+	return seq, err
+}
+
+// CheckpointResult holds the parsed checkpoint data and its transactions and object changes.
+type CheckpointResult struct {
+	Checkpoint         models.SuiCheckpoint
+	Transactions       []models.SuiTransaction
+	TransactionObjects []models.SuiTransactionObject
+	EventCount         int
+}
+
+func (r *CheckpointResult) withHydratedTransactions(fullTxs []*v2.ExecutedTransaction, digests []string) (*CheckpointResult, error) {
+	if r == nil {
+		return nil, fmt.Errorf("checkpoint result is nil")
+	}
+	if len(digests) > 0 && len(fullTxs) != len(digests) {
+		return nil, fmt.Errorf("hydrated transaction count mismatch: got %d want %d", len(fullTxs), len(digests))
+	}
+
+	allTxs := make([]models.SuiTransaction, 0, len(fullTxs))
+	allTxObjs := make([]models.SuiTransactionObject, 0, len(fullTxs))
+	eventCount := 0
+	ts := r.Checkpoint.Timestamp
+	seqNum := int64(r.Checkpoint.SequenceNumber)
+
+	for i, fullTx := range fullTxs {
+		if fullTx == nil {
+			return nil, fmt.Errorf("hydrated transaction %d is nil", i)
+		}
+		if len(digests) > 0 && fullTx.GetDigest() != digests[i] {
+			return nil, fmt.Errorf("hydrated transaction digest mismatch at %d: got %s want %s", i, fullTx.GetDigest(), digests[i])
+		}
+
+		parsedTx, txObjs, err := mapTransaction(fullTx, seqNum, ts)
+		if err != nil {
+			return nil, fmt.Errorf("map transaction %s: %w", fullTx.GetDigest(), err)
+		}
+		allTxs = append(allTxs, parsedTx)
+		allTxObjs = append(allTxObjs, txObjs...)
+		if fullTx.Events != nil {
+			eventCount += len(fullTx.Events.Events)
+		}
+	}
+
+	result := *r
+	result.Transactions = allTxs
+	result.TransactionObjects = allTxObjs
+	result.EventCount = eventCount
+	return &result, nil
+}
+
+// GetCheckpoint fetches a single checkpoint by sequence number and returns the mapped data.
+func (c *SuiClient) GetCheckpoint(ctx context.Context, seqNum int64) (*CheckpointResult, error) {
+	cpData, err := c.GetCheckpointData(ctx, seqNum)
+	if err != nil {
+		return nil, err
+	}
+	if len(cpData.TransactionDigests) == 0 {
+		return cpData.Result, nil
+	}
+
+	fullTxs, err := c.BatchGetTransactions(ctx, cpData.TransactionDigests)
+	if err != nil {
+		return nil, err
+	}
+	return cpData.BuildResult(fullTxs)
+}
+
+// GetTransaction fetches one fully-hydrated transaction by digest.
+func (c *SuiClient) GetTransaction(ctx context.Context, digest string) (*v2.ExecutedTransaction, error) {
+	if strings.TrimSpace(digest) == "" {
+		return nil, fmt.Errorf("transaction digest is empty")
+	}
+
+	var result *v2.ExecutedTransaction
+	err := c.callWithRetryAndFallback(ctx, "GetTransaction", digest, func(active *SuiClient) error {
+		if err := active.acquireGRPCSlot(ctx); err != nil {
+			return err
+		}
+		defer active.releaseGRPCSlot()
+		startedAt := time.Now()
+		log.Printf(
+			"get transaction start endpoint=%s token=%q digest=%s",
+			active.grpcEndpoint,
+			active.rpcHeaders["x-token"],
+			digest,
+		)
+		req := &v2.GetTransactionRequest{
+			Digest: &digest,
+			ReadMask: &fieldmaskpb.FieldMask{
+				Paths: []string{"digest", "transaction", "effects", "events", "balance_changes"},
+			},
+		}
+		if err := active.rateWait(ctx); err != nil {
+			return err
+		}
+		rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
+		defer cancel()
+
+		resp, err := active.grpcClient.LedgerClient().GetTransaction(rpcCtx, req)
+		if err != nil && rpcCtx.Err() != nil {
+			log.Printf(
+				"get transaction failed endpoint=%s token=%q digest=%s elapsed=%s err=%v",
+				active.grpcEndpoint,
+				active.rpcHeaders["x-token"],
+				digest,
+				time.Since(startedAt).Round(time.Millisecond),
+				err,
+			)
+			return fmt.Errorf("rpc timeout after %s: %w", active.rpcTimeout, err)
+		}
+		if err != nil {
+			log.Printf(
+				"get transaction failed endpoint=%s token=%q digest=%s elapsed=%s err=%v",
+				active.grpcEndpoint,
+				active.rpcHeaders["x-token"],
+				digest,
+				time.Since(startedAt).Round(time.Millisecond),
+				err,
+			)
+			return err
+		}
+		if resp == nil || resp.Transaction == nil {
+			return fmt.Errorf("transaction %s not found", digest)
+		}
+		log.Printf(
+			"get transaction complete endpoint=%s token=%q digest=%s elapsed=%s",
+			active.grpcEndpoint,
+			active.rpcHeaders["x-token"],
+			digest,
+			time.Since(startedAt).Round(time.Millisecond),
+		)
+		result = resp.Transaction
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetCheckpointData fetches checkpoint metadata and either returns a fully
+// populated result (when transactions are inline) or the ordered digest list
+// needed for a follow-up BatchGetTransactions call.
+func (c *SuiClient) GetCheckpointData(ctx context.Context, seqNum int64) (*CheckpointData, error) {
+	var result *CheckpointData
+
+	err := c.callWithRetryAndFallback(ctx, "GetCheckpoint", fmt.Sprintf("%d", seqNum), func(active *SuiClient) error {
+		req := &v2.GetCheckpointRequest{
+			CheckpointId: &v2.GetCheckpointRequest_SequenceNumber{
+				SequenceNumber: uint64(seqNum),
+			},
+			ReadMask: &fieldmaskpb.FieldMask{
+				Paths: []string{"sequence_number", "digest", "summary", "signature", "contents", "transactions"},
+			},
+		}
+		if err := active.rateWait(ctx); err != nil {
+			return err
+		}
+		if err := active.acquireGRPCSlot(ctx); err != nil {
+			return err
+		}
+		defer active.releaseGRPCSlot()
+		rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
+		defer cancel()
+
+		resp, err := active.grpcClient.LedgerClient().GetCheckpoint(rpcCtx, req)
+		if err != nil {
+			return err
+		}
+
+		if resp.Checkpoint == nil {
+			return fmt.Errorf("checkpoint not found")
+		}
+
+		mapped := mapCheckpoint(resp.Checkpoint)
+		if len(resp.Checkpoint.Transactions) > 0 {
+			built, err := mapped.withHydratedTransactions(resp.Checkpoint.Transactions, nil)
+			if err != nil {
+				return err
+			}
+			result = &CheckpointData{Result: built}
+			return nil
+		}
+
+		digests := checkpointTransactionDigests(resp.Checkpoint.Contents)
+		result = &CheckpointData{
+			Result:             mapped,
+			TransactionDigests: digests,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetCheckpointDataBatch fetches up to 10 checkpoints in one GraphQL request and
+// falls back to gRPC per checkpoint if the GraphQL response is incomplete.
+func (c *SuiClient) GetCheckpointDataBatch(ctx context.Context, seqNums []int64) (map[int64]*CheckpointData, error) {
+	if len(seqNums) == 0 {
+		return nil, nil
+	}
+
+	if len(seqNums) > checkpointBatchSize {
+		return nil, fmt.Errorf("checkpoint batch too large: got %d want <= %d", len(seqNums), checkpointBatchSize)
+	}
+
+	results, err := c.getCheckpointDataBatchViaGraphQL(ctx, seqNums)
+	if err != nil {
+		log.Printf(
+			"[CheckpointBatch] GraphQL batch failed range=[%d-%d] checkpoints=%d, falling back to gRPC: %v",
+			seqNums[0],
+			seqNums[len(seqNums)-1],
+			len(seqNums),
+			err,
+		)
+		return c.getCheckpointDataBatchViaGRPC(ctx, seqNums)
+	}
+
+	for _, seq := range seqNums {
+		if results[seq] != nil {
+			continue
+		}
+		log.Printf(
+			"[CheckpointBatch] GraphQL response missing checkpoint=%d in range=[%d-%d]; falling back to gRPC",
+			seq,
+			seqNums[0],
+			seqNums[len(seqNums)-1],
+		)
+		cp, fallbackErr := c.GetCheckpointData(ctx, seq)
+		if fallbackErr != nil {
+			log.Printf("[CheckpointBatch] gRPC fallback failed checkpoint=%d after missing GraphQL node: %v", seq, fallbackErr)
+			return nil, fallbackErr
+		}
+		log.Printf("[CheckpointBatch] gRPC fallback complete checkpoint=%d after missing GraphQL node", seq)
+		results[seq] = cp
+	}
+
+	return results, nil
+}
+
+// BatchGetTransactions hydrates multiple transaction digests in order.
+func (c *SuiClient) BatchGetTransactions(ctx context.Context, digests []string) ([]*v2.ExecutedTransaction, error) {
+	if len(digests) == 0 {
+		return nil, nil
+	}
+
+	results := make([]*v2.ExecutedTransaction, len(digests))
+	err := c.callWithRetryAndFallback(ctx, "BatchGetTransactions", fmt.Sprintf("%d digests", len(digests)), func(active *SuiClient) error {
+		if err := active.acquireBatchTxSlot(ctx); err != nil {
+			return err
+		}
+		defer active.releaseBatchTxSlot()
+		if err := active.acquireGRPCSlot(ctx); err != nil {
+			return err
+		}
+		defer active.releaseGRPCSlot()
+		startedAt := time.Now()
+		log.Printf(
+			"batch get transactions start endpoint=%s token=%q digests=%d",
+			active.grpcEndpoint,
+			active.rpcHeaders["x-token"],
+			len(digests),
+		)
+
+		req := &v2.BatchGetTransactionsRequest{
+			Digests: digests,
+			ReadMask: &fieldmaskpb.FieldMask{
+				Paths: []string{"digest", "transaction", "effects", "events", "balance_changes"},
+			},
+		}
+		if err := active.rateWait(ctx); err != nil {
+			return err
+		}
+		rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
+		defer cancel()
+		resp, err := active.grpcClient.LedgerClient().BatchGetTransactions(rpcCtx, req)
+		if err != nil && rpcCtx.Err() != nil {
+			log.Printf(
+				"batch get transactions failed endpoint=%s token=%q digests=%d elapsed=%s err=%v",
+				active.grpcEndpoint,
+				active.rpcHeaders["x-token"],
+				len(digests),
+				time.Since(startedAt).Round(time.Millisecond),
+				err,
+			)
+			return fmt.Errorf("rpc timeout after %s: %w", active.rpcTimeout, err)
+		}
+		if err != nil {
+			log.Printf(
+				"batch get transactions failed endpoint=%s token=%q digests=%d elapsed=%s err=%v",
+				active.grpcEndpoint,
+				active.rpcHeaders["x-token"],
+				len(digests),
+				time.Since(startedAt).Round(time.Millisecond),
+				err,
+			)
+			return err
+		}
+		log.Printf(
+			"batch get transactions complete endpoint=%s token=%q digests=%d elapsed=%s",
+			active.grpcEndpoint,
+			active.rpcHeaders["x-token"],
+			len(digests),
+			time.Since(startedAt).Round(time.Millisecond),
+		)
+		if resp == nil {
+			return fmt.Errorf("batch transaction response is nil")
+		}
+		if len(resp.Transactions) != len(digests) {
+			return fmt.Errorf("batch transaction response count mismatch: got %d want %d", len(resp.Transactions), len(digests))
+		}
+
+		for i, result := range resp.Transactions {
+			if result == nil {
+				return fmt.Errorf("batch transaction result %d is nil", i)
+			}
+			if tx := result.GetTransaction(); tx != nil {
+				results[i] = tx
+				continue
+			}
+			if rpcErr := result.GetError(); rpcErr != nil {
+				return fmt.Errorf("batch transaction %s failed: code=%d message=%s", digests[i], rpcErr.Code, rpcErr.Message)
+			}
+			return fmt.Errorf("batch transaction %s returned no transaction payload", digests[i])
+		}
+		return nil
+	})
+
+	return results, err
+}
+
+func checkpointTransactionDigests(contents *v2.CheckpointContents) []string {
+	if contents == nil || len(contents.Transactions) == 0 {
+		return nil
+	}
+	digests := make([]string, 0, len(contents.Transactions))
+	for _, txInfo := range contents.Transactions {
+		if txInfo == nil || txInfo.Transaction == nil {
+			continue
+		}
+		digests = append(digests, *txInfo.Transaction)
+	}
+	return digests
+}
+
+type graphQLCheckpointBatchResponse struct {
+	Data struct {
+		Checkpoints graphQLCheckpointConnection `json:"checkpoints"`
+	} `json:"data"`
+	Errors []graphQLError `json:"errors"`
+}
+
+type graphQLCheckpointPaginationResponse struct {
+	Data struct {
+		Page *graphQLCheckpointPaginationNode `json:"page"`
+	} `json:"data"`
+	Errors []graphQLError `json:"errors"`
+}
+
+type graphQLError struct {
+	Message string `json:"message"`
+}
+
+type graphQLCheckpointNode struct {
+	SequenceNumber           *int64                       `json:"sequenceNumber"`
+	Digest                   string                       `json:"digest"`
+	PreviousCheckpointDigest *string                      `json:"previousCheckpointDigest"`
+	NetworkTotalTransactions *int64                       `json:"networkTotalTransactions"`
+	Timestamp                string                       `json:"timestamp"`
+	Transactions             graphQLTransactionConnection `json:"transactions"`
+}
+
+type graphQLCheckpointConnection struct {
+	Nodes []graphQLCheckpointNode `json:"nodes"`
+}
+
+type graphQLCheckpointPaginationNode struct {
+	Query *graphQLCheckpointQueryRoot `json:"query"`
+}
+
+type graphQLCheckpointQueryRoot struct {
+	Transactions graphQLTransactionConnection `json:"transactions"`
+}
+
+type graphQLTransactionConnection struct {
+	Nodes    []graphQLDigestNode `json:"nodes"`
+	PageInfo graphQLPageInfo     `json:"pageInfo"`
+}
+
+type graphQLDigestNode struct {
+	Digest string `json:"digest"`
+}
+
+type graphQLPageInfo struct {
+	HasNextPage bool    `json:"hasNextPage"`
+	EndCursor   *string `json:"endCursor"`
+}
+
+func (c *SuiClient) getCheckpointDataBatchViaGraphQL(ctx context.Context, seqNums []int64) (map[int64]*CheckpointData, error) {
+	if strings.TrimSpace(c.graphQLURL) == "" {
+		return nil, fmt.Errorf("graphql url is empty")
+	}
+	if err := c.graphQLRateWait(ctx); err != nil {
+		return nil, err
+	}
+	startedAt := time.Now()
+	log.Printf(
+		"checkpoint batch fetch start graphql=%s checkpoints=%d range=[%d-%d]",
+		c.graphQLURL,
+		len(seqNums),
+		seqNums[0],
+		seqNums[len(seqNums)-1],
+	)
+
+	query := buildCheckpointBatchQuery(seqNums)
+	payload := map[string]any{"query": query}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal graphql request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build graphql request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		log.Printf(
+			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s err=%v",
+			c.graphQLURL,
+			len(seqNums),
+			seqNums[0],
+			seqNums[len(seqNums)-1],
+			time.Since(startedAt).Round(time.Millisecond),
+			err,
+		)
+		return nil, fmt.Errorf("post graphql request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf(
+			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s status=%d",
+			c.graphQLURL,
+			len(seqNums),
+			seqNums[0],
+			seqNums[len(seqNums)-1],
+			time.Since(startedAt).Round(time.Millisecond),
+			resp.StatusCode,
+		)
+		return nil, fmt.Errorf("graphql status %d", resp.StatusCode)
+	}
+
+	var decoded graphQLCheckpointBatchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		log.Printf(
+			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s err=%v",
+			c.graphQLURL,
+			len(seqNums),
+			seqNums[0],
+			seqNums[len(seqNums)-1],
+			time.Since(startedAt).Round(time.Millisecond),
+			err,
+		)
+		return nil, fmt.Errorf("decode graphql response: %w", err)
+	}
+	if len(decoded.Errors) > 0 {
+		log.Printf(
+			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s err=%s",
+			c.graphQLURL,
+			len(seqNums),
+			seqNums[0],
+			seqNums[len(seqNums)-1],
+			time.Since(startedAt).Round(time.Millisecond),
+			decoded.Errors[0].Message,
+		)
+		return nil, fmt.Errorf("graphql error: %s", decoded.Errors[0].Message)
+	}
+
+	results := make(map[int64]*CheckpointData, len(seqNums))
+	for i := range decoded.Data.Checkpoints.Nodes {
+		node := &decoded.Data.Checkpoints.Nodes[i]
+		cpData, incomplete, endCursor, err := mapGraphQLCheckpointNode(node)
+		if err != nil {
+			seq := int64(-1)
+			if node.SequenceNumber != nil {
+				seq = *node.SequenceNumber
+			}
+			log.Printf("[CheckpointBatch] GraphQL checkpoint mapping failed checkpoint=%d: %v", seq, err)
+			return nil, fmt.Errorf("map graphql checkpoint %d: %w", seq, err)
+		}
+		seq := int64(cpData.Result.Checkpoint.SequenceNumber)
+		if incomplete {
+			log.Printf(
+				"[CheckpointBatch] GraphQL digest pagination disabled for checkpoint=%d initial_digests=%d cursor=%q; falling back to gRPC for full checkpoint contents",
+				seq,
+				len(cpData.TransactionDigests),
+				stringValue(endCursor),
+			)
+			fallback, fallbackErr := c.GetCheckpointData(ctx, seq)
+			if fallbackErr != nil {
+				log.Printf("[CheckpointBatch] gRPC fallback failed checkpoint=%d: %v", seq, fallbackErr)
+				return nil, fallbackErr
+			}
+			log.Printf("[CheckpointBatch] gRPC fallback complete checkpoint=%d after incomplete GraphQL checkpoint data", seq)
+			results[seq] = fallback
+			continue
+		}
+		results[seq] = cpData
+	}
+
+	log.Printf(
+		"checkpoint batch fetch complete graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s",
+		c.graphQLURL,
+		len(seqNums),
+		seqNums[0],
+		seqNums[len(seqNums)-1],
+		time.Since(startedAt).Round(time.Millisecond),
+	)
+
+	return results, nil
+}
+
+func (c *SuiClient) getCheckpointDataBatchViaGRPC(ctx context.Context, seqNums []int64) (map[int64]*CheckpointData, error) {
+	results := make(map[int64]*CheckpointData, len(seqNums))
+	for _, seq := range seqNums {
+		cp, err := c.GetCheckpointData(ctx, seq)
+		if err != nil {
+			return nil, err
+		}
+		results[seq] = cp
+	}
+	return results, nil
+}
+
+func buildCheckpointBatchQuery(seqNums []int64) string {
+	if len(seqNums) == 0 {
+		return ""
+	}
+	start := seqNums[0]
+	end := seqNums[len(seqNums)-1]
+	afterCheckpoint := start - 1
+	beforeCheckpoint := end + 1
+	return fmt.Sprintf(`
+query BatchCheckpoints {
+  checkpoints(
+    first: %d
+    filter: { afterCheckpoint: %d, beforeCheckpoint: %d }
+  ) {
+    nodes {
+      sequenceNumber
+      digest
+      previousCheckpointDigest
+      networkTotalTransactions
+      timestamp
+      transactions(first: %d) {
+        pageInfo { hasNextPage endCursor }
+        nodes { digest }
+      }
+    }
+  }
+}`, len(seqNums), afterCheckpoint, beforeCheckpoint, checkpointDigestPageSize)
+}
+
+func mapGraphQLCheckpointNode(node *graphQLCheckpointNode) (*CheckpointData, bool, *string, error) {
+	if node == nil || node.SequenceNumber == nil {
+		return nil, false, nil, fmt.Errorf("checkpoint node is nil")
+	}
+
+	ts, err := time.Parse(time.RFC3339, node.Timestamp)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("parse timestamp %q: %w", node.Timestamp, err)
+	}
+
+	var networkTotal uint32
+	if node.NetworkTotalTransactions != nil {
+		if *node.NetworkTotalTransactions < 0 {
+			return nil, false, nil, fmt.Errorf("negative networkTotalTransactions")
+		}
+		if *node.NetworkTotalTransactions > math.MaxUint32 {
+			networkTotal = math.MaxUint32
+		} else {
+			networkTotal = uint32(*node.NetworkTotalTransactions)
+		}
+	}
+
+	prev := ""
+	if node.PreviousCheckpointDigest != nil {
+		prev = *node.PreviousCheckpointDigest
+	}
+
+	var digests []string
+	incomplete := false
+	digests = make([]string, 0, len(node.Transactions.Nodes))
+	for _, tx := range node.Transactions.Nodes {
+		if strings.TrimSpace(tx.Digest) == "" {
+			continue
+		}
+		digests = append(digests, tx.Digest)
+	}
+	incomplete = node.Transactions.PageInfo.HasNextPage
+
+	endCursor := node.Transactions.PageInfo.EndCursor
+
+	return &CheckpointData{
+		Result: &CheckpointResult{
+			Checkpoint: models.SuiCheckpoint{
+				SequenceNumber:           uint64(*node.SequenceNumber),
+				Digest:                   node.Digest,
+				PreviousCheckpointDigest: prev,
+				NetworkTotalTransactions: networkTotal,
+				Timestamp:                ts,
+			},
+		},
+		TransactionDigests: digests,
+	}, incomplete, endCursor, nil
+}
+
+func (c *SuiClient) fetchCheckpointTransactionDigestsPaginated(
+	ctx context.Context,
+	seqNum int64,
+	initialDigests []string,
+	cursor *string,
+) ([]string, error) {
+	digests := make([]string, 0, len(initialDigests)+checkpointDigestPageSize)
+	digests = append(digests, initialDigests...)
+	seenDigests := make(map[string]struct{}, len(initialDigests))
+	for _, digest := range initialDigests {
+		if strings.TrimSpace(digest) == "" {
+			continue
+		}
+		seenDigests[digest] = struct{}{}
+	}
+
+	nextCursor := cursor
+	seenCursors := make(map[string]struct{})
+	pageCount := 0
+	log.Printf(
+		"checkpoint digest pagination start graphql=%s checkpoint=%d initial_digests=%d cursor=%q",
+		c.graphQLURL,
+		seqNum,
+		len(initialDigests),
+		stringValue(cursor),
+	)
+	for nextCursor != nil && *nextCursor != "" {
+		pageCount++
+		if pageCount > maxCheckpointDigestPages {
+			return nil, fmt.Errorf("checkpoint %d pagination exceeded max pages (%d)", seqNum, maxCheckpointDigestPages)
+		}
+		if _, exists := seenCursors[*nextCursor]; exists {
+			return nil, fmt.Errorf("checkpoint %d pagination repeated cursor %q", seqNum, *nextCursor)
+		}
+		seenCursors[*nextCursor] = struct{}{}
+
+		page, hasNext, endCursor, err := c.fetchCheckpointTransactionDigestPage(ctx, seqNum, *nextCursor)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 && hasNext {
+			return nil, fmt.Errorf("checkpoint %d pagination returned empty page with hasNextPage=true", seqNum)
+		}
+
+		newDigestCount := 0
+		for _, digest := range page {
+			if strings.TrimSpace(digest) == "" {
+				continue
+			}
+			if _, exists := seenDigests[digest]; exists {
+				continue
+			}
+			seenDigests[digest] = struct{}{}
+			digests = append(digests, digest)
+			newDigestCount++
+		}
+		if newDigestCount == 0 && hasNext {
+			return nil, fmt.Errorf("checkpoint %d pagination produced no new digests for cursor %q", seqNum, *nextCursor)
+		}
+		log.Printf(
+			"checkpoint digest pagination progress graphql=%s checkpoint=%d page=%d cursor=%q page_digests=%d new_digests=%d total_unique_digests=%d has_next=%t next_cursor=%q",
+			c.graphQLURL,
+			seqNum,
+			pageCount,
+			*nextCursor,
+			len(page),
+			newDigestCount,
+			len(digests),
+			hasNext,
+			stringValue(endCursor),
+		)
+		if !hasNext {
+			break
+		}
+		if endCursor == nil || *endCursor == "" {
+			return nil, fmt.Errorf("checkpoint %d pagination missing endCursor while hasNextPage=true", seqNum)
+		}
+		nextCursor = endCursor
+	}
+
+	log.Printf(
+		"checkpoint digest pagination complete graphql=%s checkpoint=%d pages=%d total_unique_digests=%d",
+		c.graphQLURL,
+		seqNum,
+		pageCount,
+		len(digests),
+	)
+	return digests, nil
+}
+
+func (c *SuiClient) fetchCheckpointTransactionDigestPage(
+	ctx context.Context,
+	seqNum int64,
+	cursor string,
+) ([]string, bool, *string, error) {
+	if err := c.graphQLRateWait(ctx); err != nil {
+		return nil, false, nil, err
+	}
+	startedAt := time.Now()
+	log.Printf(
+		"checkpoint digest page fetch start graphql=%s checkpoint=%d cursor=%q",
+		c.graphQLURL,
+		seqNum,
+		cursor,
+	)
+
+	query := buildCheckpointDigestPageQuery(seqNum, cursor)
+	payload := map[string]any{"query": query}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("marshal graphql pagination request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("build graphql pagination request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		log.Printf(
+			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s err=%v",
+			c.graphQLURL,
+			seqNum,
+			cursor,
+			time.Since(startedAt).Round(time.Millisecond),
+			err,
+		)
+		return nil, false, nil, fmt.Errorf("post graphql pagination request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf(
+			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s status=%d",
+			c.graphQLURL,
+			seqNum,
+			cursor,
+			time.Since(startedAt).Round(time.Millisecond),
+			resp.StatusCode,
+		)
+		return nil, false, nil, fmt.Errorf("graphql pagination status %d", resp.StatusCode)
+	}
+
+	var decoded graphQLCheckpointPaginationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		log.Printf(
+			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s err=%v",
+			c.graphQLURL,
+			seqNum,
+			cursor,
+			time.Since(startedAt).Round(time.Millisecond),
+			err,
+		)
+		return nil, false, nil, fmt.Errorf("decode graphql pagination response: %w", err)
+	}
+	if len(decoded.Errors) > 0 {
+		log.Printf(
+			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s err=%s",
+			c.graphQLURL,
+			seqNum,
+			cursor,
+			time.Since(startedAt).Round(time.Millisecond),
+			decoded.Errors[0].Message,
+		)
+		return nil, false, nil, fmt.Errorf("graphql pagination error: %s", decoded.Errors[0].Message)
+	}
+
+	node := decoded.Data.Page
+	if node == nil || node.Query == nil {
+		return nil, false, nil, fmt.Errorf("graphql pagination response missing page node")
+	}
+
+	pageDigests := make([]string, 0, len(node.Query.Transactions.Nodes))
+	for _, tx := range node.Query.Transactions.Nodes {
+		if strings.TrimSpace(tx.Digest) == "" {
+			continue
+		}
+		pageDigests = append(pageDigests, tx.Digest)
+	}
+
+	log.Printf(
+		"checkpoint digest page fetch complete graphql=%s checkpoint=%d cursor=%q digests=%d has_next=%t elapsed=%s",
+		c.graphQLURL,
+		seqNum,
+		cursor,
+		len(pageDigests),
+		node.Query.Transactions.PageInfo.HasNextPage,
+		time.Since(startedAt).Round(time.Millisecond),
+	)
+
+	return pageDigests, node.Query.Transactions.PageInfo.HasNextPage, node.Query.Transactions.PageInfo.EndCursor, nil
+}
+
+func buildCheckpointDigestPageQuery(seqNum int64, cursor string) string {
+	return fmt.Sprintf(`
+query CheckpointDigestPage {
+  page: checkpoint(sequenceNumber: %d) {
+    query {
+      transactions(first: %d, after: %q) {
+        pageInfo { hasNextPage endCursor }
+        nodes { digest }
+      }
+    }
+  }
+}`, seqNum, checkpointDigestPageSize, cursor)
+}
+
+func stringValue(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func mapCheckpoint(cp *v2.Checkpoint) *CheckpointResult {
+	seqNum := uint64(0)
+	if cp.SequenceNumber != nil {
+		seqNum = *cp.SequenceNumber
+	}
+
+	digest := ""
+	if cp.Digest != nil {
+		digest = *cp.Digest
+	}
+
+	var ts time.Time
+	prevDigest := ""
+	netTotalTx := uint32(0)
+
+	if cp.Summary != nil {
+		if cp.Summary.Timestamp != nil {
+			ts = cp.Summary.Timestamp.AsTime()
+		}
+		if cp.Summary.PreviousDigest != nil {
+			prevDigest = *cp.Summary.PreviousDigest
+		}
+		if cp.Summary.TotalNetworkTransactions != nil {
+			v := *cp.Summary.TotalNetworkTransactions
+			if v <= math.MaxUint32 {
+				netTotalTx = uint32(v)
+			} else {
+				netTotalTx = math.MaxUint32
+			}
+		}
+	}
+
+	return &CheckpointResult{
+		Checkpoint: models.SuiCheckpoint{
+			SequenceNumber:           seqNum,
+			Digest:                   digest,
+			PreviousCheckpointDigest: prevDigest,
+			NetworkTotalTransactions: netTotalTx,
+			Timestamp:                ts,
+		},
+	}
+}
+
+func mapTransaction(tx *v2.ExecutedTransaction, checkpointSeqNum int64, ts time.Time) (models.SuiTransaction, []models.SuiTransactionObject, error) {
+	txDigest := ""
+	if tx.Digest != nil {
+		txDigest = *tx.Digest
+	}
+
+	var sender *string
+	status := uint8(0)
+	kindTypename := "Unknown"
+	commandsJSON := "[]"
+	eventsJSON := "[]"
+	balanceChangesJSON := "[]"
+	gasFee := int64(0)
+
+	mo := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}
+
+	if tx.Transaction != nil {
+		raw, err := mo.Marshal(tx.Transaction)
+		if err == nil {
+			var txData map[string]any
+			if err := json.Unmarshal(raw, &txData); err == nil {
+				if s, ok := txData["sender"].(string); ok && s != "" {
+					sender = &s
+				}
+
+				kindTypename = extractKindTypename(txData)
+				commandsJSON = extractCommandsJSON(txData)
+
+				// Fallback to legacy JSON-RPC structure
+				if sender == nil {
+					if data, ok := txData["data"].(map[string]any); ok {
+						if s, ok := data["sender"].(string); ok && s != "" {
+							sender = &s
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var effectsData map[string]any
+	if tx.Effects != nil {
+		if tx.Effects.Status != nil && tx.Effects.Status.Success != nil {
+			if *tx.Effects.Status.Success {
+				status = 1
+			} else {
+				status = 2
+			}
+		}
+
+		if tx.Effects.GasUsed != nil {
+			gu := tx.Effects.GasUsed
+			var compCost, storageCost, storageRebate int64
+			if gu.ComputationCost != nil {
+				compCost = int64(*gu.ComputationCost)
+			}
+			if gu.StorageCost != nil {
+				storageCost = int64(*gu.StorageCost)
+			}
+			if gu.StorageRebate != nil {
+				storageRebate = int64(*gu.StorageRebate)
+			}
+			gasFee = compCost + storageCost - storageRebate
+			if gasFee < 0 {
+				gasFee = 0
+			}
+		}
+
+		raw, err := mo.Marshal(tx.Effects)
+		if err == nil {
+			_ = json.Unmarshal(raw, &effectsData)
+		}
+	}
+
+	balanceChangesJSON = extractBalanceChangesJSON(tx.BalanceChanges)
+
+	eventsJSON = extractEventsJSON(tx.Events)
+
+	parsedTx := models.SuiTransaction{
+		Digest:                   txDigest,
+		CheckpointSequenceNumber: uint64(checkpointSeqNum),
+		Timestamp:                ts,
+		Sender:                   sender,
+		Status:                   status,
+		KindTypename:             kindTypename,
+		CommandsJSON:             commandsJSON,
+		EventsJSON:               eventsJSON,
+		BalanceChangesJSON:       balanceChangesJSON,
+		GasFee:                   gasFee,
+	}
+
+	txObjs := extractTransactionObjects(txDigest, ts, effectsData)
+
+	return parsedTx, txObjs, nil
+}
+
+// extractKindTypename returns the transaction kind typename from the transaction JSON.
+func extractKindTypename(txData map[string]any) string {
+	switch v := txData["kind"].(type) {
+	case string:
+		return v
+	case map[string]any:
+		if k, ok := v["kind"].(string); ok {
+			return k
+		}
+		// Use the first key as typename if there's a oneOf structure
+		for key := range v {
+			return snakeToPascal(key) + "Transaction"
+		}
+	}
+	return "Unknown"
+}
+
+// extractCommandsJSON builds a minimal classification-ready JSON array from the transaction kind.
+func extractCommandsJSON(txData map[string]any) string {
+	// Navigate to commands: kind.programmable_transaction.commands
+	kindVal, ok := txData["kind"].(map[string]any)
+	if !ok {
+		return "[]"
+	}
+	ptVal, ok := kindVal["programmable_transaction"].(map[string]any)
+	if !ok {
+		return "[]"
+	}
+	cmdsRaw, ok := ptVal["commands"].([]any)
+	if !ok {
+		return "[]"
+	}
+
+	result := make([]map[string]any, 0, len(cmdsRaw))
+	for _, c := range cmdsRaw {
+		cmdMap, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		entry := mapCommand(cmdMap)
+		result = append(result, entry)
+	}
+
+	b, err := json.Marshal(result)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+func mapCommand(cmd map[string]any) map[string]any {
+	for key, val := range cmd {
+		entry := map[string]any{"__typename": snakeToPascal(key) + "Command"}
+
+		inner, _ := val.(map[string]any)
+
+		switch key {
+		case "move_call":
+			if inner != nil {
+				if fn, ok := inner["function"].(string); ok {
+					entry["function_name"] = fn
+				}
+				if pkg, ok := inner["package"].(string); ok {
+					entry["package_address"] = pkg
+				}
+			}
+		case "transfer_objects":
+			if inner != nil {
+				if inputs, ok := inner["objects"]; ok {
+					entry["transfer_inputs"] = inputs
+				}
+				if addr, ok := inner["address"]; ok {
+					entry["transfer_address"] = addr
+				}
+			}
+		}
+		return entry
+	}
+	return map[string]any{"__typename": "UnknownCommand"}
+}
+
+// extractEventsJSON serialises events as [{type, json}] for storage.
+func extractEventsJSON(events *v2.TransactionEvents) string {
+	if events == nil || len(events.Events) == 0 {
+		return "[]"
+	}
+
+	result := make([]map[string]any, 0, len(events.Events))
+	for _, evt := range events.Events {
+		entry := map[string]any{}
+		if evt.EventType != nil {
+			entry["type"] = *evt.EventType
+		}
+		if evt.Json != nil {
+			raw, err := evt.Json.MarshalJSON()
+			if err == nil {
+				var parsed any
+				if err := json.Unmarshal(raw, &parsed); err == nil {
+					entry["json"] = parsed
+				}
+			}
+		}
+		result = append(result, entry)
+	}
+
+	b, err := json.Marshal(result)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// extractBalanceChangesJSON builds [{coin_type, amount, owner_address}] from gRPC balance changes.
+func extractBalanceChangesJSON(balanceChanges []*v2.BalanceChange) string {
+	if len(balanceChanges) == 0 {
+		return "[]"
+	}
+
+	result := make([]map[string]any, 0, len(balanceChanges))
+	for _, change := range balanceChanges {
+		if change == nil {
+			continue
+		}
+		entry := map[string]any{
+			"coin_type":     change.GetCoinType(),
+			"amount":        change.GetAmount(),
+			"owner_address": nil,
+		}
+		if change.Address != nil {
+			entry["owner_address"] = change.GetAddress()
+		}
+		result = append(result, entry)
+	}
+
+	b, err := json.Marshal(result)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// extractTransactionObjects parses changed_objects from effects JSON into SuiTransactionObject rows.
+func extractTransactionObjects(txDigest string, ts time.Time, effectsData map[string]any) []models.SuiTransactionObject {
+	if effectsData == nil {
+		return nil
+	}
+	raw, ok := effectsData["changed_objects"].([]any)
+	if !ok {
+		return nil
+	}
+
+	var result []models.SuiTransactionObject
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		objectID := stringOrEmpty(m["object_id"])
+
+		inputVersion := parseUint64(m["input_version"])
+		outputVersion := parseUint64(m["output_version"])
+
+		// Determine canonical version (prefer output)
+		version := outputVersion
+		if version == 0 {
+			version = inputVersion
+		}
+
+		// Skip read-only objects
+		if version == 0 {
+			continue
+		}
+
+		// Skip unchanged objects (same digest in both states)
+		inputDigestStr := stringOrEmpty(m["input_digest"])
+		outputDigestStr := stringOrEmpty(m["output_digest"])
+		if inputDigestStr != "" && outputDigestStr != "" && inputDigestStr == outputDigestStr {
+			continue
+		}
+
+		idOperation := stringOrEmpty(m["id_operation"])
+		isCreated := uint8(0)
+		isDeleted := uint8(0)
+		if idOperation == "Created" {
+			isCreated = 1
+		} else if idOperation == "Deleted" || idOperation == "Wrapped" {
+			isDeleted = 1
+		}
+
+		obj := models.SuiTransactionObject{
+			ObjectID:          objectID,
+			Version:           version,
+			TransactionDigest: txDigest,
+			InputVersion:      inputVersion,
+			InputOwner:        nullableString(ownerAddress(m["input_owner"])),
+			InputDigest:       nullableString(inputDigestStr),
+			OutputVersion:     outputVersion,
+			OutputOwner:       nullableString(ownerAddress(m["output_owner"])),
+			OutputDigest:      nullableString(outputDigestStr),
+			IsCreated:         isCreated,
+			IsDeleted:         isDeleted,
+			Timestamp:         ts,
+		}
+		result = append(result, obj)
+	}
+
+	return result
+}
+
+// ownerAddress extracts the owner address string from an owner map.
+func ownerAddress(owner any) string {
+	if owner == nil {
+		return ""
+	}
+	switch v := owner.(type) {
+	case string:
+		return v
+	case map[string]any:
+		if addr, ok := v["address"].(string); ok {
+			return addr
+		}
+		if objID, ok := v["object_id"].(string); ok {
+			return objID
+		}
+		if kind, ok := v["kind"].(string); ok {
+			return kind
+		}
+	}
+	return ""
+}
+
+func nullableString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func stringOrEmpty(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func parseUint64(v any) uint64 {
+	switch n := v.(type) {
+	case float64:
+		return uint64(n)
+	case string:
+		var u uint64
+		fmt.Sscanf(n, "%d", &u)
+		return u
+	}
+	return 0
+}
+
+// snakeToPascal converts "move_call" → "MoveCall".
+func snakeToPascal(s string) string {
+	parts := strings.Split(s, "_")
+	for i, p := range parts {
+		if len(p) > 0 {
+			parts[i] = strings.ToUpper(p[:1]) + p[1:]
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+func withRetry(label string, fn func() error) error {
+	return withRetryContext(context.Background(), label, fn)
+}
+
+func withRetryContext(ctx context.Context, label string, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%s canceled: %w", label, err)
+		}
+		if attempt > 0 {
+			delay := backoffDelay(attempt)
+			fmt.Printf("[%s] Retry %d/%d after %v, last err: %v\n", label, attempt, maxRetries, delay, lastErr)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("%s canceled: %w", label, ctx.Err())
+			case <-timer.C:
+			}
+		}
+
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%s canceled: %w", label, err)
+		}
+		if attempt == 0 {
+			fmt.Printf("[%s] First attempt failed: %v\n", label, lastErr)
+		}
+	}
+	fmt.Printf("[%s] All %d retries exhausted, last err: %v\n", label, maxRetries, lastErr)
+	return fmt.Errorf("%s failed after %d retries: %w", label, maxRetries, lastErr)
+}
+
+func backoffDelay(attempt int) time.Duration {
+	baseMs := math.Min(float64(initialBackoffMs)*math.Pow(2, float64(attempt-1)), float64(maxBackoffMs))
+	jitterMs := rand.Float64() * 1000
+	return time.Duration(baseMs+jitterMs) * time.Millisecond
+}
+
+func isGatewayTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "504") && strings.Contains(message, "Gateway Timeout")
+}
