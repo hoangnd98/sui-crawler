@@ -60,7 +60,7 @@ Orchestrator ──polls──▶ MongoDB     │ progress updates
 2. Splits work into internal processing chunks of `500` checkpoints.
 3. Fetches checkpoint metadata from Sui GraphQL in batches of `10` checkpoints using `checkpoints(filter: ...)`.
 4. Reads up to `50` transaction digests per checkpoint from GraphQL and falls back to archive gRPC `GetCheckpoint` when a checkpoint is incomplete or missing from the GraphQL batch response.
-5. Aggregates digests across multiple checkpoints and hydrates them through archive gRPC `BatchGetTransactions` in shared batches of up to `5` digests, with adaptive split if the archive still rejects a request as too large.
+5. Aggregates digests across multiple checkpoints and hydrates them through archive gRPC `BatchGetTransactions` in shared batches of up to `5` digests, with adaptive split if the archive rejects a request as too large or the aggregate response exceeds gRPC receive limits.
 6. Buffers completed checkpoints until they are contiguous, then flushes ordered rows to ClickHouse.
 7. Reports `ReportBatchComplete` only after data is persisted, so MongoDB `last_checkpoint` reflects durable progress.
 

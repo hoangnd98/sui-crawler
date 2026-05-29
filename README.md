@@ -47,7 +47,7 @@ The crawler uses a **Job Orchestrator Pattern** to manage data ingestion tasks e
 - The worker batches GraphQL checkpoint discovery in windows of `10` checkpoints using the `checkpoints(filter: ...)` query shape.
 - Each GraphQL checkpoint node reads up to `50` transaction digests directly from `transactions(first: 50)`.
 - If GraphQL omits a checkpoint or returns `hasNextPage=true` for that checkpoint, the crawler falls back to archive gRPC `GetCheckpoint` for that checkpoint only.
-- Transaction hydration still runs through archive gRPC `BatchGetTransactions` after digest discovery completes, chunked to 5 digests per RPC with adaptive split on archive request-size errors.
+- Transaction hydration still runs through archive gRPC `BatchGetTransactions` after digest discovery completes, chunked to 5 digests per RPC with adaptive split on archive request-size or gRPC response-size errors.
 - In `github.com/open-move/sui-go-sdk v0.0.1`, transaction balance changes are returned on top-level `ExecutedTransaction.balance_changes`, so gRPC transaction read masks must explicitly request `balance_changes`.
 
 3.  **Database Initialization (ClickHouse):**

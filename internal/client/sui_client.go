@@ -28,6 +28,7 @@ const (
 	initialBackoffMs            = 1000
 	maxBackoffMs                = 60000
 	defaultRPCTimeout           = 5 * time.Minute
+	maxGRPCMessageSize          = 64 * 1024 * 1024
 	publicBatchTxParallelism    = 10
 	nonPublicBatchTxParallelism = 1
 	checkpointBatchSize         = 10
@@ -62,7 +63,12 @@ func NewSuiClientWithHeaders(ctx context.Context, endpoint string, limiter *rate
 	}
 	endpoint = normalizeGRPCEndpoint(endpoint)
 
-	opts := make([]grpcsdk.Option, 0, 1)
+	opts := []grpcsdk.Option{
+		grpcsdk.WithDialOption(grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxGRPCMessageSize),
+			grpc.MaxCallSendMsgSize(maxGRPCMessageSize),
+		)),
+	}
 	if len(headers) > 0 {
 		opts = append(opts, grpcsdk.WithDialOption(grpc.WithUnaryInterceptor(unaryMetadataInterceptor(headers))))
 	}
@@ -290,7 +296,7 @@ func (c *SuiClient) callWithRetryAndFallback(
 	if err == nil {
 		return nil
 	}
-	if isArchiveReadRowsRequestTooLargeError(err) {
+	if isAdaptiveBatchSplitError(err) {
 		return err
 	}
 
@@ -660,7 +666,7 @@ func (c *SuiClient) batchGetTransactionsChunk(
 	if err == nil {
 		return nil
 	}
-	if !isArchiveReadRowsRequestTooLargeError(err) || len(chunk) == 1 {
+	if !isAdaptiveBatchSplitError(err) || len(chunk) == 1 {
 		return err
 	}
 
@@ -1161,7 +1167,7 @@ func withRetryContext(ctx context.Context, label string, fn func() error) error 
 		if lastErr == nil {
 			return nil
 		}
-		if isArchiveReadRowsRequestTooLargeError(lastErr) {
+		if isAdaptiveBatchSplitError(lastErr) {
 			return lastErr
 		}
 		if err := ctx.Err(); err != nil {
@@ -1196,4 +1202,16 @@ func isArchiveReadRowsRequestTooLargeError(err error) bool {
 	message := err.Error()
 	return strings.Contains(message, "Received ReadRowsRequest message too large") &&
 		strings.Contains(message, "maximum allowed: 524288")
+}
+
+func isGRPCMessageTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "grpc: received message larger than max")
+}
+
+func isAdaptiveBatchSplitError(err error) bool {
+	return isArchiveReadRowsRequestTooLargeError(err) || isGRPCMessageTooLargeError(err)
 }

@@ -96,19 +96,55 @@ func TestArchiveReadRowsRequestTooLargeErrorIsDetected(t *testing.T) {
 	}
 }
 
-func TestWithRetryContextDoesNotRetryArchiveReadRowsRequestTooLarge(t *testing.T) {
-	errTooLarge := errors.New(`Received ReadRowsRequest message too large (1599460, maximum allowed: 524288)`)
-	attempts := 0
+func TestGRPCMessageTooLargeErrorIsDetected(t *testing.T) {
+	err := errors.New(`rpc error: code = ResourceExhausted desc = grpc: received message larger than max (4570720 vs. 4194304)`)
 
-	err := withRetryContext(t.Context(), "test", func() error {
-		attempts++
-		return errTooLarge
-	})
-
-	if !errors.Is(err, errTooLarge) {
-		t.Fatalf("withRetryContext error = %v, want %v", err, errTooLarge)
+	if !isGRPCMessageTooLargeError(err) {
+		t.Fatal("isGRPCMessageTooLargeError = false, want true")
 	}
-	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1", attempts)
+	if !isAdaptiveBatchSplitError(err) {
+		t.Fatal("isAdaptiveBatchSplitError = false, want true")
+	}
+}
+
+func TestWithRetryContextDoesNotRetryAdaptiveBatchSplitErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "archive read rows request too large",
+			err:  errors.New(`Received ReadRowsRequest message too large (1599460, maximum allowed: 524288)`),
+		},
+		{
+			name: "grpc response message too large",
+			err:  errors.New(`grpc: received message larger than max (4570720 vs. 4194304)`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			attempts := 0
+
+			err := withRetryContext(t.Context(), "test", func() error {
+				attempts++
+				return tt.err
+			})
+
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("withRetryContext error = %v, want %v", err, tt.err)
+			}
+			if attempts != 1 {
+				t.Fatalf("attempts = %d, want 1", attempts)
+			}
+		})
+	}
+}
+
+func TestGRPCMessageSizeLimitIsAboveDefault(t *testing.T) {
+	const defaultGRPCMessageSize = 4 * 1024 * 1024
+
+	if maxGRPCMessageSize <= defaultGRPCMessageSize {
+		t.Fatalf("maxGRPCMessageSize = %d, want > %d", maxGRPCMessageSize, defaultGRPCMessageSize)
 	}
 }
