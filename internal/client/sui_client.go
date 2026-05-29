@@ -1,14 +1,13 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
-	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -32,22 +31,22 @@ const (
 	publicBatchTxParallelism    = 10
 	nonPublicBatchTxParallelism = 1
 	checkpointBatchSize         = 10
-	checkpointDigestPageSize    = 50
-	maxCheckpointDigestPages    = 1000
+
+	// MaxBatchGetTransactionsDigests caps one archive BatchGetTransactions RPC.
+	// The archive endpoint can reject larger batches because the underlying
+	// Bigtable ReadRows request exceeds 512 KiB even when the gRPC payload is small.
+	MaxBatchGetTransactionsDigests = 20
 )
 
 type SuiClient struct {
 	grpcClient             *grpcsdk.Client
 	grpcEndpoint           string
 	rateLimiter            *rate.Limiter
-	graphQLRateLimiter     *rate.Limiter
 	rpcTimeout             time.Duration
 	grpcSemaphore          chan struct{}
 	batchTxSemaphore       chan struct{}
 	rpcHeaders             map[string]string
 	jsonRPCURL             string
-	graphQLURL             string
-	httpClient             *http.Client
 	gatewayTimeoutFallback *SuiClient
 }
 
@@ -59,8 +58,9 @@ func NewSuiClient(ctx context.Context, endpoint string, limiter *rate.Limiter) (
 // NewSuiClientWithHeaders creates a new SUI gRPC client with optional per-RPC headers.
 func NewSuiClientWithHeaders(ctx context.Context, endpoint string, limiter *rate.Limiter, headers map[string]string) (*SuiClient, error) {
 	if endpoint == "" {
-		endpoint = "https://archive.mainnet.sui.io:443"
+		endpoint = "https://archive.mainnet.sui.io"
 	}
+	endpoint = normalizeGRPCEndpoint(endpoint)
 
 	opts := make([]grpcsdk.Option, 0, 1)
 	if len(headers) > 0 {
@@ -81,8 +81,6 @@ func NewSuiClientWithHeaders(ctx context.Context, endpoint string, limiter *rate
 		batchTxSemaphore: make(chan struct{}, batchTxParallelism(headers)),
 		rpcHeaders:       cloneHeaders(headers),
 		jsonRPCURL:       "",
-		graphQLURL:       "https://graphql.mainnet.sui.io/graphql",
-		httpClient:       &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
@@ -128,6 +126,29 @@ func cloneHeaders(headers map[string]string) map[string]string {
 	return cloned
 }
 
+func normalizeGRPCEndpoint(endpoint string) string {
+	trimmed := strings.TrimSpace(endpoint)
+	if !strings.Contains(trimmed, "://") {
+		return trimmed
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "https" && scheme != "grpcs") || parsed.Port() != "443" {
+		return trimmed
+	}
+
+	host := parsed.Hostname()
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	parsed.Host = host
+	return parsed.String()
+}
+
 func batchTxParallelism(headers map[string]string) int {
 	if len(headers) > 0 && strings.TrimSpace(headers["x-token"]) != "" {
 		return nonPublicBatchTxParallelism
@@ -171,30 +192,11 @@ func (c *SuiClient) SetJSONRPCURL(url string) {
 	}
 }
 
-// SetGraphQLURL overrides the GraphQL endpoint used for checkpoint batch queries.
-func (c *SuiClient) SetGraphQLURL(url string) {
-	if url != "" {
-		c.graphQLURL = url
-	}
-}
-
-// SetGraphQLRateLimiter configures a separate rate limiter for GraphQL HTTP requests.
-func (c *SuiClient) SetGraphQLRateLimiter(limiter *rate.Limiter) {
-	c.graphQLRateLimiter = limiter
-}
-
 func (c *SuiClient) rateWait(ctx context.Context) error {
 	if c.rateLimiter == nil {
 		return nil
 	}
 	return c.rateLimiter.Wait(ctx)
-}
-
-func (c *SuiClient) graphQLRateWait(ctx context.Context) error {
-	if c.graphQLRateLimiter == nil {
-		return nil
-	}
-	return c.graphQLRateLimiter.Wait(ctx)
 }
 
 func (c *SuiClient) acquireBatchTxSlot(ctx context.Context) error {
@@ -527,8 +529,7 @@ func (c *SuiClient) GetCheckpointData(ctx context.Context, seqNum int64) (*Check
 	return result, nil
 }
 
-// GetCheckpointDataBatch fetches up to 10 checkpoints in one GraphQL request and
-// falls back to gRPC per checkpoint if the GraphQL response is incomplete.
+// GetCheckpointDataBatch fetches up to 10 checkpoints through gRPC only.
 func (c *SuiClient) GetCheckpointDataBatch(ctx context.Context, seqNums []int64) (map[int64]*CheckpointData, error) {
 	if len(seqNums) == 0 {
 		return nil, nil
@@ -538,38 +539,7 @@ func (c *SuiClient) GetCheckpointDataBatch(ctx context.Context, seqNums []int64)
 		return nil, fmt.Errorf("checkpoint batch too large: got %d want <= %d", len(seqNums), checkpointBatchSize)
 	}
 
-	results, err := c.getCheckpointDataBatchViaGraphQL(ctx, seqNums)
-	if err != nil {
-		log.Printf(
-			"[CheckpointBatch] GraphQL batch failed range=[%d-%d] checkpoints=%d, falling back to gRPC: %v",
-			seqNums[0],
-			seqNums[len(seqNums)-1],
-			len(seqNums),
-			err,
-		)
-		return c.getCheckpointDataBatchViaGRPC(ctx, seqNums)
-	}
-
-	for _, seq := range seqNums {
-		if results[seq] != nil {
-			continue
-		}
-		log.Printf(
-			"[CheckpointBatch] GraphQL response missing checkpoint=%d in range=[%d-%d]; falling back to gRPC",
-			seq,
-			seqNums[0],
-			seqNums[len(seqNums)-1],
-		)
-		cp, fallbackErr := c.GetCheckpointData(ctx, seq)
-		if fallbackErr != nil {
-			log.Printf("[CheckpointBatch] gRPC fallback failed checkpoint=%d after missing GraphQL node: %v", seq, fallbackErr)
-			return nil, fallbackErr
-		}
-		log.Printf("[CheckpointBatch] gRPC fallback complete checkpoint=%d after missing GraphQL node", seq)
-		results[seq] = cp
-	}
-
-	return results, nil
+	return c.getCheckpointDataBatchViaGRPC(ctx, seqNums)
 }
 
 // BatchGetTransactions hydrates multiple transaction digests in order.
@@ -579,88 +549,109 @@ func (c *SuiClient) BatchGetTransactions(ctx context.Context, digests []string) 
 	}
 
 	results := make([]*v2.ExecutedTransaction, len(digests))
-	err := c.callWithRetryAndFallback(ctx, "BatchGetTransactions", fmt.Sprintf("%d digests", len(digests)), func(active *SuiClient) error {
-		if err := active.acquireBatchTxSlot(ctx); err != nil {
-			return err
-		}
-		defer active.releaseBatchTxSlot()
-		if err := active.acquireGRPCSlot(ctx); err != nil {
-			return err
-		}
-		defer active.releaseGRPCSlot()
-		startedAt := time.Now()
-		log.Printf(
-			"batch get transactions start endpoint=%s token=%q digests=%d",
-			active.grpcEndpoint,
-			active.rpcHeaders["x-token"],
-			len(digests),
-		)
 
-		req := &v2.BatchGetTransactionsRequest{
-			Digests: digests,
-			ReadMask: &fieldmaskpb.FieldMask{
-				Paths: []string{"digest", "transaction", "effects", "events", "balance_changes"},
-			},
+	for start := 0; start < len(digests); start += MaxBatchGetTransactionsDigests {
+		end := start + MaxBatchGetTransactionsDigests
+		if end > len(digests) {
+			end = len(digests)
 		}
-		if err := active.rateWait(ctx); err != nil {
-			return err
-		}
-		rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
-		defer cancel()
-		resp, err := active.grpcClient.LedgerClient().BatchGetTransactions(rpcCtx, req)
-		if err != nil && rpcCtx.Err() != nil {
+		chunk := digests[start:end]
+		chunkStart := start
+
+		err := c.callWithRetryAndFallback(ctx, "BatchGetTransactions", fmt.Sprintf("%d digests", len(chunk)), func(active *SuiClient) error {
+			if err := active.acquireBatchTxSlot(ctx); err != nil {
+				return err
+			}
+			defer active.releaseBatchTxSlot()
+			if err := active.acquireGRPCSlot(ctx); err != nil {
+				return err
+			}
+			defer active.releaseGRPCSlot()
+			startedAt := time.Now()
 			log.Printf(
-				"batch get transactions failed endpoint=%s token=%q digests=%d elapsed=%s err=%v",
+				"batch get transactions start endpoint=%s token=%q digests=%d offset=%d total=%d",
 				active.grpcEndpoint,
 				active.rpcHeaders["x-token"],
+				len(chunk),
+				chunkStart,
+				len(digests),
+			)
+
+			req := &v2.BatchGetTransactionsRequest{
+				Digests: chunk,
+				ReadMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"digest", "transaction", "effects", "events", "balance_changes"},
+				},
+			}
+			if err := active.rateWait(ctx); err != nil {
+				return err
+			}
+			rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
+			defer cancel()
+			resp, err := active.grpcClient.LedgerClient().BatchGetTransactions(rpcCtx, req)
+			if err != nil && rpcCtx.Err() != nil {
+				log.Printf(
+					"batch get transactions failed endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s err=%v",
+					active.grpcEndpoint,
+					active.rpcHeaders["x-token"],
+					len(chunk),
+					chunkStart,
+					len(digests),
+					time.Since(startedAt).Round(time.Millisecond),
+					err,
+				)
+				return fmt.Errorf("rpc timeout after %s: %w", active.rpcTimeout, err)
+			}
+			if err != nil {
+				log.Printf(
+					"batch get transactions failed endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s err=%v",
+					active.grpcEndpoint,
+					active.rpcHeaders["x-token"],
+					len(chunk),
+					chunkStart,
+					len(digests),
+					time.Since(startedAt).Round(time.Millisecond),
+					err,
+				)
+				return err
+			}
+			log.Printf(
+				"batch get transactions complete endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s",
+				active.grpcEndpoint,
+				active.rpcHeaders["x-token"],
+				len(chunk),
+				chunkStart,
 				len(digests),
 				time.Since(startedAt).Round(time.Millisecond),
-				err,
 			)
-			return fmt.Errorf("rpc timeout after %s: %w", active.rpcTimeout, err)
-		}
+			if resp == nil {
+				return fmt.Errorf("batch transaction response is nil")
+			}
+			if len(resp.Transactions) != len(chunk) {
+				return fmt.Errorf("batch transaction response count mismatch: got %d want %d", len(resp.Transactions), len(chunk))
+			}
+
+			for i, result := range resp.Transactions {
+				if result == nil {
+					return fmt.Errorf("batch transaction result %d is nil", chunkStart+i)
+				}
+				if tx := result.GetTransaction(); tx != nil {
+					results[chunkStart+i] = tx
+					continue
+				}
+				if rpcErr := result.GetError(); rpcErr != nil {
+					return fmt.Errorf("batch transaction %s failed: code=%d message=%s", chunk[i], rpcErr.Code, rpcErr.Message)
+				}
+				return fmt.Errorf("batch transaction %s returned no transaction payload", chunk[i])
+			}
+			return nil
+		})
 		if err != nil {
-			log.Printf(
-				"batch get transactions failed endpoint=%s token=%q digests=%d elapsed=%s err=%v",
-				active.grpcEndpoint,
-				active.rpcHeaders["x-token"],
-				len(digests),
-				time.Since(startedAt).Round(time.Millisecond),
-				err,
-			)
-			return err
+			return results, err
 		}
-		log.Printf(
-			"batch get transactions complete endpoint=%s token=%q digests=%d elapsed=%s",
-			active.grpcEndpoint,
-			active.rpcHeaders["x-token"],
-			len(digests),
-			time.Since(startedAt).Round(time.Millisecond),
-		)
-		if resp == nil {
-			return fmt.Errorf("batch transaction response is nil")
-		}
-		if len(resp.Transactions) != len(digests) {
-			return fmt.Errorf("batch transaction response count mismatch: got %d want %d", len(resp.Transactions), len(digests))
-		}
+	}
 
-		for i, result := range resp.Transactions {
-			if result == nil {
-				return fmt.Errorf("batch transaction result %d is nil", i)
-			}
-			if tx := result.GetTransaction(); tx != nil {
-				results[i] = tx
-				continue
-			}
-			if rpcErr := result.GetError(); rpcErr != nil {
-				return fmt.Errorf("batch transaction %s failed: code=%d message=%s", digests[i], rpcErr.Code, rpcErr.Message)
-			}
-			return fmt.Errorf("batch transaction %s returned no transaction payload", digests[i])
-		}
-		return nil
-	})
-
-	return results, err
+	return results, nil
 }
 
 func checkpointTransactionDigests(contents *v2.CheckpointContents) []string {
@@ -677,187 +668,6 @@ func checkpointTransactionDigests(contents *v2.CheckpointContents) []string {
 	return digests
 }
 
-type graphQLCheckpointBatchResponse struct {
-	Data struct {
-		Checkpoints graphQLCheckpointConnection `json:"checkpoints"`
-	} `json:"data"`
-	Errors []graphQLError `json:"errors"`
-}
-
-type graphQLCheckpointPaginationResponse struct {
-	Data struct {
-		Page *graphQLCheckpointPaginationNode `json:"page"`
-	} `json:"data"`
-	Errors []graphQLError `json:"errors"`
-}
-
-type graphQLError struct {
-	Message string `json:"message"`
-}
-
-type graphQLCheckpointNode struct {
-	SequenceNumber           *int64                       `json:"sequenceNumber"`
-	Digest                   string                       `json:"digest"`
-	PreviousCheckpointDigest *string                      `json:"previousCheckpointDigest"`
-	NetworkTotalTransactions *int64                       `json:"networkTotalTransactions"`
-	Timestamp                string                       `json:"timestamp"`
-	Transactions             graphQLTransactionConnection `json:"transactions"`
-}
-
-type graphQLCheckpointConnection struct {
-	Nodes []graphQLCheckpointNode `json:"nodes"`
-}
-
-type graphQLCheckpointPaginationNode struct {
-	Query *graphQLCheckpointQueryRoot `json:"query"`
-}
-
-type graphQLCheckpointQueryRoot struct {
-	Transactions graphQLTransactionConnection `json:"transactions"`
-}
-
-type graphQLTransactionConnection struct {
-	Nodes    []graphQLDigestNode `json:"nodes"`
-	PageInfo graphQLPageInfo     `json:"pageInfo"`
-}
-
-type graphQLDigestNode struct {
-	Digest string `json:"digest"`
-}
-
-type graphQLPageInfo struct {
-	HasNextPage bool    `json:"hasNextPage"`
-	EndCursor   *string `json:"endCursor"`
-}
-
-func (c *SuiClient) getCheckpointDataBatchViaGraphQL(ctx context.Context, seqNums []int64) (map[int64]*CheckpointData, error) {
-	if strings.TrimSpace(c.graphQLURL) == "" {
-		return nil, fmt.Errorf("graphql url is empty")
-	}
-	if err := c.graphQLRateWait(ctx); err != nil {
-		return nil, err
-	}
-	startedAt := time.Now()
-	log.Printf(
-		"checkpoint batch fetch start graphql=%s checkpoints=%d range=[%d-%d]",
-		c.graphQLURL,
-		len(seqNums),
-		seqNums[0],
-		seqNums[len(seqNums)-1],
-	)
-
-	query := buildCheckpointBatchQuery(seqNums)
-	payload := map[string]any{"query": query}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal graphql request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build graphql request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		log.Printf(
-			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s err=%v",
-			c.graphQLURL,
-			len(seqNums),
-			seqNums[0],
-			seqNums[len(seqNums)-1],
-			time.Since(startedAt).Round(time.Millisecond),
-			err,
-		)
-		return nil, fmt.Errorf("post graphql request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf(
-			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s status=%d",
-			c.graphQLURL,
-			len(seqNums),
-			seqNums[0],
-			seqNums[len(seqNums)-1],
-			time.Since(startedAt).Round(time.Millisecond),
-			resp.StatusCode,
-		)
-		return nil, fmt.Errorf("graphql status %d", resp.StatusCode)
-	}
-
-	var decoded graphQLCheckpointBatchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		log.Printf(
-			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s err=%v",
-			c.graphQLURL,
-			len(seqNums),
-			seqNums[0],
-			seqNums[len(seqNums)-1],
-			time.Since(startedAt).Round(time.Millisecond),
-			err,
-		)
-		return nil, fmt.Errorf("decode graphql response: %w", err)
-	}
-	if len(decoded.Errors) > 0 {
-		log.Printf(
-			"checkpoint batch fetch failed graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s err=%s",
-			c.graphQLURL,
-			len(seqNums),
-			seqNums[0],
-			seqNums[len(seqNums)-1],
-			time.Since(startedAt).Round(time.Millisecond),
-			decoded.Errors[0].Message,
-		)
-		return nil, fmt.Errorf("graphql error: %s", decoded.Errors[0].Message)
-	}
-
-	results := make(map[int64]*CheckpointData, len(seqNums))
-	for i := range decoded.Data.Checkpoints.Nodes {
-		node := &decoded.Data.Checkpoints.Nodes[i]
-		cpData, incomplete, endCursor, err := mapGraphQLCheckpointNode(node)
-		if err != nil {
-			seq := int64(-1)
-			if node.SequenceNumber != nil {
-				seq = *node.SequenceNumber
-			}
-			log.Printf("[CheckpointBatch] GraphQL checkpoint mapping failed checkpoint=%d: %v", seq, err)
-			return nil, fmt.Errorf("map graphql checkpoint %d: %w", seq, err)
-		}
-		seq := int64(cpData.Result.Checkpoint.SequenceNumber)
-		if incomplete {
-			log.Printf(
-				"[CheckpointBatch] GraphQL digest pagination disabled for checkpoint=%d initial_digests=%d cursor=%q; falling back to gRPC for full checkpoint contents",
-				seq,
-				len(cpData.TransactionDigests),
-				stringValue(endCursor),
-			)
-			fallback, fallbackErr := c.GetCheckpointData(ctx, seq)
-			if fallbackErr != nil {
-				log.Printf("[CheckpointBatch] gRPC fallback failed checkpoint=%d: %v", seq, fallbackErr)
-				return nil, fallbackErr
-			}
-			log.Printf("[CheckpointBatch] gRPC fallback complete checkpoint=%d after incomplete GraphQL checkpoint data", seq)
-			results[seq] = fallback
-			continue
-		}
-		results[seq] = cpData
-	}
-
-	log.Printf(
-		"checkpoint batch fetch complete graphql=%s checkpoints=%d range=[%d-%d] elapsed=%s",
-		c.graphQLURL,
-		len(seqNums),
-		seqNums[0],
-		seqNums[len(seqNums)-1],
-		time.Since(startedAt).Round(time.Millisecond),
-	)
-
-	return results, nil
-}
-
 func (c *SuiClient) getCheckpointDataBatchViaGRPC(ctx context.Context, seqNums []int64) (map[int64]*CheckpointData, error) {
 	results := make(map[int64]*CheckpointData, len(seqNums))
 	for _, seq := range seqNums {
@@ -868,306 +678,6 @@ func (c *SuiClient) getCheckpointDataBatchViaGRPC(ctx context.Context, seqNums [
 		results[seq] = cp
 	}
 	return results, nil
-}
-
-func buildCheckpointBatchQuery(seqNums []int64) string {
-	if len(seqNums) == 0 {
-		return ""
-	}
-	start := seqNums[0]
-	end := seqNums[len(seqNums)-1]
-	afterCheckpoint := start - 1
-	beforeCheckpoint := end + 1
-	return fmt.Sprintf(`
-query BatchCheckpoints {
-  checkpoints(
-    first: %d
-    filter: { afterCheckpoint: %d, beforeCheckpoint: %d }
-  ) {
-    nodes {
-      sequenceNumber
-      digest
-      previousCheckpointDigest
-      networkTotalTransactions
-      timestamp
-      transactions(first: %d) {
-        pageInfo { hasNextPage endCursor }
-        nodes { digest }
-      }
-    }
-  }
-}`, len(seqNums), afterCheckpoint, beforeCheckpoint, checkpointDigestPageSize)
-}
-
-func mapGraphQLCheckpointNode(node *graphQLCheckpointNode) (*CheckpointData, bool, *string, error) {
-	if node == nil || node.SequenceNumber == nil {
-		return nil, false, nil, fmt.Errorf("checkpoint node is nil")
-	}
-
-	ts, err := time.Parse(time.RFC3339, node.Timestamp)
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("parse timestamp %q: %w", node.Timestamp, err)
-	}
-
-	var networkTotal uint32
-	if node.NetworkTotalTransactions != nil {
-		if *node.NetworkTotalTransactions < 0 {
-			return nil, false, nil, fmt.Errorf("negative networkTotalTransactions")
-		}
-		if *node.NetworkTotalTransactions > math.MaxUint32 {
-			networkTotal = math.MaxUint32
-		} else {
-			networkTotal = uint32(*node.NetworkTotalTransactions)
-		}
-	}
-
-	prev := ""
-	if node.PreviousCheckpointDigest != nil {
-		prev = *node.PreviousCheckpointDigest
-	}
-
-	var digests []string
-	incomplete := false
-	digests = make([]string, 0, len(node.Transactions.Nodes))
-	for _, tx := range node.Transactions.Nodes {
-		if strings.TrimSpace(tx.Digest) == "" {
-			continue
-		}
-		digests = append(digests, tx.Digest)
-	}
-	incomplete = node.Transactions.PageInfo.HasNextPage
-
-	endCursor := node.Transactions.PageInfo.EndCursor
-
-	return &CheckpointData{
-		Result: &CheckpointResult{
-			Checkpoint: models.SuiCheckpoint{
-				SequenceNumber:           uint64(*node.SequenceNumber),
-				Digest:                   node.Digest,
-				PreviousCheckpointDigest: prev,
-				NetworkTotalTransactions: networkTotal,
-				Timestamp:                ts,
-			},
-		},
-		TransactionDigests: digests,
-	}, incomplete, endCursor, nil
-}
-
-func (c *SuiClient) fetchCheckpointTransactionDigestsPaginated(
-	ctx context.Context,
-	seqNum int64,
-	initialDigests []string,
-	cursor *string,
-) ([]string, error) {
-	digests := make([]string, 0, len(initialDigests)+checkpointDigestPageSize)
-	digests = append(digests, initialDigests...)
-	seenDigests := make(map[string]struct{}, len(initialDigests))
-	for _, digest := range initialDigests {
-		if strings.TrimSpace(digest) == "" {
-			continue
-		}
-		seenDigests[digest] = struct{}{}
-	}
-
-	nextCursor := cursor
-	seenCursors := make(map[string]struct{})
-	pageCount := 0
-	log.Printf(
-		"checkpoint digest pagination start graphql=%s checkpoint=%d initial_digests=%d cursor=%q",
-		c.graphQLURL,
-		seqNum,
-		len(initialDigests),
-		stringValue(cursor),
-	)
-	for nextCursor != nil && *nextCursor != "" {
-		pageCount++
-		if pageCount > maxCheckpointDigestPages {
-			return nil, fmt.Errorf("checkpoint %d pagination exceeded max pages (%d)", seqNum, maxCheckpointDigestPages)
-		}
-		if _, exists := seenCursors[*nextCursor]; exists {
-			return nil, fmt.Errorf("checkpoint %d pagination repeated cursor %q", seqNum, *nextCursor)
-		}
-		seenCursors[*nextCursor] = struct{}{}
-
-		page, hasNext, endCursor, err := c.fetchCheckpointTransactionDigestPage(ctx, seqNum, *nextCursor)
-		if err != nil {
-			return nil, err
-		}
-		if len(page) == 0 && hasNext {
-			return nil, fmt.Errorf("checkpoint %d pagination returned empty page with hasNextPage=true", seqNum)
-		}
-
-		newDigestCount := 0
-		for _, digest := range page {
-			if strings.TrimSpace(digest) == "" {
-				continue
-			}
-			if _, exists := seenDigests[digest]; exists {
-				continue
-			}
-			seenDigests[digest] = struct{}{}
-			digests = append(digests, digest)
-			newDigestCount++
-		}
-		if newDigestCount == 0 && hasNext {
-			return nil, fmt.Errorf("checkpoint %d pagination produced no new digests for cursor %q", seqNum, *nextCursor)
-		}
-		log.Printf(
-			"checkpoint digest pagination progress graphql=%s checkpoint=%d page=%d cursor=%q page_digests=%d new_digests=%d total_unique_digests=%d has_next=%t next_cursor=%q",
-			c.graphQLURL,
-			seqNum,
-			pageCount,
-			*nextCursor,
-			len(page),
-			newDigestCount,
-			len(digests),
-			hasNext,
-			stringValue(endCursor),
-		)
-		if !hasNext {
-			break
-		}
-		if endCursor == nil || *endCursor == "" {
-			return nil, fmt.Errorf("checkpoint %d pagination missing endCursor while hasNextPage=true", seqNum)
-		}
-		nextCursor = endCursor
-	}
-
-	log.Printf(
-		"checkpoint digest pagination complete graphql=%s checkpoint=%d pages=%d total_unique_digests=%d",
-		c.graphQLURL,
-		seqNum,
-		pageCount,
-		len(digests),
-	)
-	return digests, nil
-}
-
-func (c *SuiClient) fetchCheckpointTransactionDigestPage(
-	ctx context.Context,
-	seqNum int64,
-	cursor string,
-) ([]string, bool, *string, error) {
-	if err := c.graphQLRateWait(ctx); err != nil {
-		return nil, false, nil, err
-	}
-	startedAt := time.Now()
-	log.Printf(
-		"checkpoint digest page fetch start graphql=%s checkpoint=%d cursor=%q",
-		c.graphQLURL,
-		seqNum,
-		cursor,
-	)
-
-	query := buildCheckpointDigestPageQuery(seqNum, cursor)
-	payload := map[string]any{"query": query}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("marshal graphql pagination request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("build graphql pagination request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		log.Printf(
-			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s err=%v",
-			c.graphQLURL,
-			seqNum,
-			cursor,
-			time.Since(startedAt).Round(time.Millisecond),
-			err,
-		)
-		return nil, false, nil, fmt.Errorf("post graphql pagination request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf(
-			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s status=%d",
-			c.graphQLURL,
-			seqNum,
-			cursor,
-			time.Since(startedAt).Round(time.Millisecond),
-			resp.StatusCode,
-		)
-		return nil, false, nil, fmt.Errorf("graphql pagination status %d", resp.StatusCode)
-	}
-
-	var decoded graphQLCheckpointPaginationResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		log.Printf(
-			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s err=%v",
-			c.graphQLURL,
-			seqNum,
-			cursor,
-			time.Since(startedAt).Round(time.Millisecond),
-			err,
-		)
-		return nil, false, nil, fmt.Errorf("decode graphql pagination response: %w", err)
-	}
-	if len(decoded.Errors) > 0 {
-		log.Printf(
-			"checkpoint digest page fetch failed graphql=%s checkpoint=%d cursor=%q elapsed=%s err=%s",
-			c.graphQLURL,
-			seqNum,
-			cursor,
-			time.Since(startedAt).Round(time.Millisecond),
-			decoded.Errors[0].Message,
-		)
-		return nil, false, nil, fmt.Errorf("graphql pagination error: %s", decoded.Errors[0].Message)
-	}
-
-	node := decoded.Data.Page
-	if node == nil || node.Query == nil {
-		return nil, false, nil, fmt.Errorf("graphql pagination response missing page node")
-	}
-
-	pageDigests := make([]string, 0, len(node.Query.Transactions.Nodes))
-	for _, tx := range node.Query.Transactions.Nodes {
-		if strings.TrimSpace(tx.Digest) == "" {
-			continue
-		}
-		pageDigests = append(pageDigests, tx.Digest)
-	}
-
-	log.Printf(
-		"checkpoint digest page fetch complete graphql=%s checkpoint=%d cursor=%q digests=%d has_next=%t elapsed=%s",
-		c.graphQLURL,
-		seqNum,
-		cursor,
-		len(pageDigests),
-		node.Query.Transactions.PageInfo.HasNextPage,
-		time.Since(startedAt).Round(time.Millisecond),
-	)
-
-	return pageDigests, node.Query.Transactions.PageInfo.HasNextPage, node.Query.Transactions.PageInfo.EndCursor, nil
-}
-
-func buildCheckpointDigestPageQuery(seqNum int64, cursor string) string {
-	return fmt.Sprintf(`
-query CheckpointDigestPage {
-  page: checkpoint(sequenceNumber: %d) {
-    query {
-      transactions(first: %d, after: %q) {
-        pageInfo { hasNextPage endCursor }
-        nodes { digest }
-      }
-    }
-  }
-}`, seqNum, checkpointDigestPageSize, cursor)
-}
-
-func stringValue(v *string) string {
-	if v == nil {
-		return ""
-	}
-	return *v
 }
 
 func mapCheckpoint(cp *v2.Checkpoint) *CheckpointResult {

@@ -88,7 +88,7 @@ Orchestrator ──polls──▶ MongoDB     │ progress updates
 | `MONGO_URI` | `mongodb://localhost:27019` | MongoDB connection |
 | `MONGO_DB` | `sui_crawler` | Database name |
 | `API_PORT` | `8080` | REST API + Swagger port |
-| `SUI_RPC_URL` | `https://archive.mainnet.sui.io:443` | Archive Sui gRPC endpoint used for backfill |
+| `SUI_RPC_URL` | `https://archive.mainnet.sui.io` | Archive Sui gRPC endpoint used for backfill |
 | `SUI_GRAPHQL_URL` | `https://graphql.mainnet.sui.io/graphql` | Sui GraphQL endpoint used for checkpoint discovery |
 | `SUI_RATE_LIMIT_RPS` | `10.0` | Archive gRPC request budget |
 | `SUI_GRAPHQL_RATE_LIMIT_RPS` | `3.0` | GraphQL request budget |

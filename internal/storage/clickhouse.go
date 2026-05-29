@@ -2,9 +2,12 @@ package storage
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"math"
 	"math/rand"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -20,6 +23,24 @@ const (
 	maxBackoffMs     = 60000
 )
 
+const insertCheckpointsQuery = `INSERT INTO sui_checkpoints (
+		sequence_number, digest, previous_checkpoint_digest,
+		network_total_transactions, timestamp
+	)`
+
+const insertTransactionsQuery = `INSERT INTO sui_transactions (
+		digest, checkpoint_sequence_number, timestamp,
+		sender, status, kind_typename,
+		commands_json, events_json, balance_changes_json, gas_fee
+	)`
+
+const insertTransactionObjectsQuery = `INSERT INTO sui_transaction_objects (
+		object_id, version, transaction_digest,
+		input_version, input_owner, input_digest,
+		output_version, output_owner, output_digest,
+		is_created, is_deleted, timestamp
+	)`
+
 // ClickHouseStorage provides batch insert operations for SUI data into ClickHouse cloud.
 type ClickHouseStorage struct {
 	conn driver.Conn
@@ -27,7 +48,30 @@ type ClickHouseStorage struct {
 
 // NewClickHouseStorage creates a new ClickHouse connection.
 func NewClickHouseStorage(addr, database, username, password string) (*ClickHouseStorage, error) {
-	conn, err := clickhouse.Open(&clickhouse.Options{
+	options, err := newClickHouseOptions(addr, database, username, password)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := clickhouse.Open(options)
+	if err != nil {
+		return nil, fmt.Errorf("open clickhouse connection: %w", err)
+	}
+
+	if err := conn.Ping(context.Background()); err != nil {
+		return nil, fmt.Errorf("ping clickhouse: %w", err)
+	}
+
+	return &ClickHouseStorage{conn: conn}, nil
+}
+
+func newClickHouseOptions(addr, database, username, password string) (*clickhouse.Options, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil, fmt.Errorf("CLICK_HOUSE_ADDR must not be empty")
+	}
+
+	options := &clickhouse.Options{
 		Addr: []string{addr},
 		Auth: clickhouse.Auth{
 			Database: database,
@@ -43,16 +87,34 @@ func NewClickHouseStorage(addr, database, username, password string) (*ClickHous
 		MaxOpenConns:    10,
 		MaxIdleConns:    5,
 		ConnMaxLifetime: 10 * time.Minute,
-	})
+	}
+
+	if !strings.Contains(addr, "://") {
+		return options, nil
+	}
+
+	parsed, err := url.Parse(addr)
 	if err != nil {
-		return nil, fmt.Errorf("open clickhouse connection: %w", err)
+		return nil, fmt.Errorf("parse CLICK_HOUSE_ADDR: %w", err)
+	}
+	switch parsed.Scheme {
+	case "http", "https":
+		if parsed.Host == "" {
+			return nil, fmt.Errorf("CLICK_HOUSE_ADDR URL must include a host")
+		}
+		options.Protocol = clickhouse.HTTP
+		options.Addr = []string{parsed.Host}
+		if parsed.Scheme == "https" {
+			options.TLS = &tls.Config{ServerName: parsed.Hostname()}
+		}
+		if parsed.Path != "" && parsed.Path != "/" {
+			options.HttpUrlPath = parsed.Path
+		}
+	default:
+		return nil, fmt.Errorf("unsupported CLICK_HOUSE_ADDR scheme %q", parsed.Scheme)
 	}
 
-	if err := conn.Ping(context.Background()); err != nil {
-		return nil, fmt.Errorf("ping clickhouse: %w", err)
-	}
-
-	return &ClickHouseStorage{conn: conn}, nil
+	return options, nil
 }
 
 // Close closes the ClickHouse connection.
@@ -121,10 +183,7 @@ func (s *ClickHouseStorage) InsertTransactionObjects(ctx context.Context, rows [
 }
 
 func (s *ClickHouseStorage) insertCheckpointBatch(ctx context.Context, rows []models.SuiCheckpoint) error {
-	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO sui_checkpoints (
-		sequence_number, digest, previous_checkpoint_digest,
-		network_total_transactions, timestamp
-	)`)
+	batch, err := s.conn.PrepareBatch(ctx, insertCheckpointsQuery)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -142,11 +201,7 @@ func (s *ClickHouseStorage) insertCheckpointBatch(ctx context.Context, rows []mo
 }
 
 func (s *ClickHouseStorage) insertTransactionBatch(ctx context.Context, rows []models.SuiTransaction) error {
-	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO sui_transactions (
-		digest, checkpoint_sequence_number, timestamp,
-		sender, status, kind_typename,
-		commands_json, events_json, balance_changes_json, gas_fee
-	)`)
+	batch, err := s.conn.PrepareBatch(ctx, insertTransactionsQuery)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
@@ -165,12 +220,7 @@ func (s *ClickHouseStorage) insertTransactionBatch(ctx context.Context, rows []m
 }
 
 func (s *ClickHouseStorage) insertTransactionObjectBatch(ctx context.Context, rows []models.SuiTransactionObject) error {
-	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO sui_transaction_objects (
-		object_id, version, transaction_digest,
-		input_version, input_owner, input_digest,
-		output_version, output_owner, output_digest,
-		is_created, is_deleted, timestamp
-	)`)
+	batch, err := s.conn.PrepareBatch(ctx, insertTransactionObjectsQuery)
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"testing"
@@ -111,6 +112,86 @@ func TestHydrateCheckpointHydratesTransactions(t *testing.T) {
 	}
 	if got := result.Transactions[0].Digest; got != "tx-10a" {
 		t.Fatalf("checkpoint digest = %q, want %q", got, "tx-10a")
+	}
+}
+
+func TestHydrateTransactionsByDigestSplitsIntoArchiveSafeBatches(t *testing.T) {
+	fetcher := &fakeCheckpointFetcher{
+		txByDigest: map[string]*v2.ExecutedTransaction{},
+	}
+	digests := make([]string, client.MaxBatchGetTransactionsDigests*2+5)
+	for i := range digests {
+		digest := fmt.Sprintf("tx-%02d", i)
+		digests[i] = digest
+		fetcher.txByDigest[digest] = &v2.ExecutedTransaction{Digest: ptr(digest)}
+	}
+
+	txByDigest, err := hydrateTransactionsByDigest(context.Background(), fetcher, digests)
+	if err != nil {
+		t.Fatalf("hydrateTransactionsByDigest returned error: %v", err)
+	}
+
+	wantBatchSizes := []int{
+		client.MaxBatchGetTransactionsDigests,
+		client.MaxBatchGetTransactionsDigests,
+		5,
+	}
+	if got := len(fetcher.batchCalls); got != len(wantBatchSizes) {
+		t.Fatalf("BatchGetTransactions call count = %d, want %d", got, len(wantBatchSizes))
+	}
+	for i, want := range wantBatchSizes {
+		if got := len(fetcher.batchCalls[i]); got != want {
+			t.Fatalf("batch %d digest count = %d, want %d", i, got, want)
+		}
+		if got := fetcher.batchCalls[i][0]; got != digests[i*client.MaxBatchGetTransactionsDigests] {
+			t.Fatalf("batch %d first digest = %q, want %q", i, got, digests[i*client.MaxBatchGetTransactionsDigests])
+		}
+	}
+	if got := len(txByDigest); got != len(digests) {
+		t.Fatalf("hydrated transaction map size = %d, want %d", got, len(digests))
+	}
+}
+
+func TestValidateCheckpointTransactionCountDetectsMissingTransaction(t *testing.T) {
+	previous := &models.SuiCheckpoint{
+		SequenceNumber:           10,
+		NetworkTotalTransactions: 100,
+	}
+	result := &client.CheckpointResult{
+		Checkpoint: models.SuiCheckpoint{
+			SequenceNumber:           11,
+			NetworkTotalTransactions: 103,
+		},
+		Transactions: []models.SuiTransaction{
+			{Digest: "tx-1"},
+			{Digest: "tx-2"},
+		},
+	}
+
+	err := validateCheckpointTransactionCount(previous, result)
+	if err == nil {
+		t.Fatal("validateCheckpointTransactionCount error = nil, want mismatch")
+	}
+}
+
+func TestValidateCheckpointTransactionCountAcceptsMatchingDelta(t *testing.T) {
+	previous := &models.SuiCheckpoint{
+		SequenceNumber:           10,
+		NetworkTotalTransactions: 100,
+	}
+	result := &client.CheckpointResult{
+		Checkpoint: models.SuiCheckpoint{
+			SequenceNumber:           11,
+			NetworkTotalTransactions: 102,
+		},
+		Transactions: []models.SuiTransaction{
+			{Digest: "tx-1"},
+			{Digest: "tx-2"},
+		},
+	}
+
+	if err := validateCheckpointTransactionCount(previous, result); err != nil {
+		t.Fatalf("validateCheckpointTransactionCount returned error: %v", err)
 	}
 }
 

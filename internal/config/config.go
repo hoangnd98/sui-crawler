@@ -20,8 +20,6 @@ type Config struct {
 	SuiRPCURL       string
 	SuiRateLimitRPS float64
 	SuiRPCTimeout   time.Duration
-	SuiGraphQLURL   string
-	SuiGraphQLRPS   float64
 
 	// SUI JSON-RPC endpoint (used for event queries, separate from gRPC)
 	SuiJSONRPCURL string
@@ -39,11 +37,9 @@ func Load() (*Config, error) {
 		MongoURI:           "mongodb://localhost:27019",
 		MongoDB:            "sui_crawler",
 		APIPort:            "8080",
-		SuiRPCURL:          "https://archive.mainnet.sui.io:443",
+		SuiRPCURL:          "https://archive.mainnet.sui.io",
 		SuiRateLimitRPS:    10.0,
 		SuiRPCTimeout:      2 * time.Minute,
-		SuiGraphQLURL:      "https://graphql.mainnet.sui.io/graphql",
-		SuiGraphQLRPS:      3.0,
 		SuiJSONRPCURL:      "",
 		ClickHouseAddr:     "localhost:9000",
 		ClickHouseDatabase: "default",
@@ -71,24 +67,12 @@ func Load() (*Config, error) {
 		cfg.SuiJSONRPCURL = v
 	}
 
-	if v := os.Getenv("SUI_GRAPHQL_URL"); v != "" {
-		cfg.SuiGraphQLURL = v
-	}
-
 	if v := os.Getenv("SUI_RATE_LIMIT_RPS"); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return nil, fmt.Errorf("invalid SUI_RATE_LIMIT_RPS: %w", err)
 		}
 		cfg.SuiRateLimitRPS = rps
-	}
-
-	if v := os.Getenv("SUI_GRAPHQL_RATE_LIMIT_RPS"); v != "" {
-		rps, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid SUI_GRAPHQL_RATE_LIMIT_RPS: %w", err)
-		}
-		cfg.SuiGraphQLRPS = rps
 	}
 
 	if v := os.Getenv("SUI_RPC_TIMEOUT"); v != "" {

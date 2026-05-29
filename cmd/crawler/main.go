@@ -98,27 +98,15 @@ func main() {
 		limiter = rate.NewLimiter(rate.Limit(cfg.SuiRateLimitRPS), burst)
 	}
 
-	var graphQLLimiter *rate.Limiter
-	if cfg.SuiGraphQLRPS > 0 {
-		burst := int(cfg.SuiGraphQLRPS)
-		if burst < 1 {
-			burst = 1
-		}
-		graphQLLimiter = rate.NewLimiter(rate.Limit(cfg.SuiGraphQLRPS), burst)
-	}
-
 	workerCfg := worker.WorkerConfig{
-		SuiRPCURL:      cfg.SuiRPCURL,
-		SuiRateRPS:     cfg.SuiRateLimitRPS,
-		SuiGraphQLURL:  cfg.SuiGraphQLURL,
-		SuiGraphQLRPS:  cfg.SuiGraphQLRPS,
-		RPCTimeout:     cfg.SuiRPCTimeout,
-		CHAddr:         cfg.ClickHouseAddr,
-		CHDatabase:     cfg.ClickHouseDatabase,
-		CHUsername:     cfg.ClickHouseUsername,
-		CHPassword:     cfg.ClickHousePassword,
-		RateLimiter:    limiter,
-		GraphQLLimiter: graphQLLimiter,
+		SuiRPCURL:   cfg.SuiRPCURL,
+		SuiRateRPS:  cfg.SuiRateLimitRPS,
+		RPCTimeout:  cfg.SuiRPCTimeout,
+		CHAddr:      cfg.ClickHouseAddr,
+		CHDatabase:  cfg.ClickHouseDatabase,
+		CHUsername:  cfg.ClickHouseUsername,
+		CHPassword:  cfg.ClickHousePassword,
+		RateLimiter: limiter,
 	}
 
 	const workerID = "crawler-worker"
@@ -164,8 +152,6 @@ func printConfig(cfg *config.Config) {
 	fmt.Printf("  RPC URL:     %s\n", cfg.SuiRPCURL)
 	fmt.Printf("  RPC Timeout: %s\n", cfg.SuiRPCTimeout)
 	fmt.Printf("  Rate Limit:  %.1f RPS\n", cfg.SuiRateLimitRPS)
-	fmt.Printf("  GraphQL URL: %s\n", cfg.SuiGraphQLURL)
-	fmt.Printf("  GraphQL RPS: %.1f RPS\n", cfg.SuiGraphQLRPS)
 	fmt.Printf("  Output Mode: ClickHouse\n")
 	fmt.Printf("  CH Address:  %s\n", cfg.ClickHouseAddr)
 	fmt.Printf("  CH Database: %s\n", cfg.ClickHouseDatabase)

@@ -22,8 +22,8 @@ const (
 	// bounding replay after failures.
 	processingChunkSize = 500
 	// transactionHydrationBatchSize caps one BatchGetTransactions RPC.
-	transactionHydrationBatchSize = 200
-	// checkpointFetchBatchSize groups multiple checkpoints into a single GraphQL request.
+	transactionHydrationBatchSize = client.MaxBatchGetTransactionsDigests
+	// checkpointFetchBatchSize groups checkpoints before gRPC fetch fanout.
 	checkpointFetchBatchSize = 10
 	// checkpointWriteBatchSize controls how many completed checkpoints are buffered
 	// before flushing to ClickHouse.
@@ -95,8 +95,6 @@ func (w *Worker) processJob(ctx context.Context, assignment models.JobAssignment
 	}
 	defer suiClient.Close()
 	suiClient.SetRPCTimeout(w.cfg.RPCTimeout)
-	suiClient.SetGraphQLURL(w.cfg.SuiGraphQLURL)
-	suiClient.SetGraphQLRateLimiter(w.cfg.GraphQLLimiter)
 
 	chStorage, err := storage.NewClickHouseStorage(
 		w.cfg.CHAddr, w.cfg.CHDatabase, w.cfg.CHUsername, w.cfg.CHPassword,
@@ -501,6 +499,7 @@ func (w *Worker) writeCheckpointStream(
 	pending := make(map[int64]*client.CheckpointResult)
 	flushUntil := startSeq - 1
 	reportedUntil := startSeq - 1
+	var previousCheckpoint *models.SuiCheckpoint
 
 	var checkpoints []models.SuiCheckpoint
 	var transactions []models.SuiTransaction
@@ -527,17 +526,22 @@ func (w *Worker) writeCheckpointStream(
 		return nil
 	}
 
-	queueContiguous := func() {
+	queueContiguous := func() error {
 		for {
 			nextSeq := flushUntil + 1
 			result := pending[nextSeq]
 			if result == nil {
-				return
+				return nil
+			}
+			if err := validateCheckpointTransactionCount(previousCheckpoint, result); err != nil {
+				return err
 			}
 			delete(pending, nextSeq)
 			checkpoints = append(checkpoints, result.Checkpoint)
 			transactions = append(transactions, result.Transactions...)
 			transactionObjects = append(transactionObjects, result.TransactionObjects...)
+			checkpoint := result.Checkpoint
+			previousCheckpoint = &checkpoint
 			flushUntil = nextSeq
 		}
 	}
@@ -548,11 +552,15 @@ func (w *Worker) writeCheckpointStream(
 			return ctx.Err()
 		case task, ok := <-results:
 			if !ok {
-				queueContiguous()
+				if err := queueContiguous(); err != nil {
+					return err
+				}
 				return flush()
 			}
 			pending[task.seq] = task.result
-			queueContiguous()
+			if err := queueContiguous(); err != nil {
+				return err
+			}
 			if len(checkpoints) >= checkpointWriteBatchSize {
 				if err := flush(); err != nil {
 					return err
@@ -566,8 +574,42 @@ func (w *Worker) writeCheckpointStream(
 	}
 }
 
+func validateCheckpointTransactionCount(previous *models.SuiCheckpoint, result *client.CheckpointResult) error {
+	if previous == nil || result == nil {
+		return nil
+	}
+
+	current := result.Checkpoint
+	maxUint32 := ^uint32(0)
+	if previous.NetworkTotalTransactions == maxUint32 || current.NetworkTotalTransactions == maxUint32 {
+		return nil
+	}
+	if current.NetworkTotalTransactions < previous.NetworkTotalTransactions {
+		return fmt.Errorf(
+			"checkpoint %d total_network_transactions regressed: previous checkpoint %d total=%d current=%d",
+			current.SequenceNumber,
+			previous.SequenceNumber,
+			previous.NetworkTotalTransactions,
+			current.NetworkTotalTransactions,
+		)
+	}
+
+	expected := int(current.NetworkTotalTransactions - previous.NetworkTotalTransactions)
+	if expected != len(result.Transactions) {
+		return fmt.Errorf(
+			"checkpoint %d transaction count mismatch: total_network_transactions delta=%d previous_total=%d current_total=%d hydrated_transactions=%d",
+			current.SequenceNumber,
+			expected,
+			previous.NetworkTotalTransactions,
+			current.NetworkTotalTransactions,
+			len(result.Transactions),
+		)
+	}
+	return nil
+}
+
 func (w *Worker) checkpointFetchConcurrency() int {
-	rps := w.cfg.SuiGraphQLRPS
+	rps := w.cfg.SuiRateRPS
 	if rps <= 0 {
 		return 1
 	}

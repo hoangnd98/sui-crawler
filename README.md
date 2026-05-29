@@ -17,7 +17,7 @@ The crawler uses a **Job Orchestrator Pattern** to manage data ingestion tasks e
 -   **Go**: 1.25 or later
 -   **MongoDB**: v6.0+ (Local or Atlas) for job orchestration and state tracking
 -   **ClickHouse**: For analytical data storage
--   **Sui RPC/gRPC endpoint**: Access to a Sui endpoint (defaults to `https://fullnode.mainnet.sui.io:443`)
+-   **Sui RPC/gRPC endpoint**: Access to a Sui endpoint (defaults to `https://archive.mainnet.sui.io`)
 
 ## Setup & Configuration
 
