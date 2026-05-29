@@ -35,7 +35,7 @@ const (
 	// MaxBatchGetTransactionsDigests caps one archive BatchGetTransactions RPC.
 	// The archive endpoint can reject larger batches because the underlying
 	// Bigtable ReadRows request exceeds 512 KiB even when the gRPC payload is small.
-	MaxBatchGetTransactionsDigests = 20
+	MaxBatchGetTransactionsDigests = 5
 )
 
 type SuiClient struct {
@@ -289,6 +289,9 @@ func (c *SuiClient) callWithRetryAndFallback(
 	})
 	if err == nil {
 		return nil
+	}
+	if isArchiveReadRowsRequestTooLargeError(err) {
+		return err
 	}
 
 	fallback := c.fallbackClient()
@@ -551,103 +554,128 @@ func (c *SuiClient) BatchGetTransactions(ctx context.Context, digests []string) 
 	results := make([]*v2.ExecutedTransaction, len(digests))
 
 	for _, batch := range batchGetTransactionDigestChunks(digests) {
-		chunk := batch.digests
-		chunkStart := batch.start
-
-		err := c.callWithRetryAndFallback(ctx, "BatchGetTransactions", fmt.Sprintf("%d digests", len(chunk)), func(active *SuiClient) error {
-			if err := active.acquireBatchTxSlot(ctx); err != nil {
-				return err
-			}
-			defer active.releaseBatchTxSlot()
-			if err := active.acquireGRPCSlot(ctx); err != nil {
-				return err
-			}
-			defer active.releaseGRPCSlot()
-			startedAt := time.Now()
-			log.Printf(
-				"batch get transactions start endpoint=%s token=%q digests=%d offset=%d total=%d",
-				active.grpcEndpoint,
-				active.rpcHeaders["x-token"],
-				len(chunk),
-				chunkStart,
-				len(digests),
-			)
-
-			req := &v2.BatchGetTransactionsRequest{
-				Digests: chunk,
-				ReadMask: &fieldmaskpb.FieldMask{
-					Paths: []string{"digest", "transaction", "effects", "events", "balance_changes"},
-				},
-			}
-			if err := active.rateWait(ctx); err != nil {
-				return err
-			}
-			rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
-			defer cancel()
-			resp, err := active.grpcClient.LedgerClient().BatchGetTransactions(rpcCtx, req)
-			if err != nil && rpcCtx.Err() != nil {
-				log.Printf(
-					"batch get transactions failed endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s err=%v",
-					active.grpcEndpoint,
-					active.rpcHeaders["x-token"],
-					len(chunk),
-					chunkStart,
-					len(digests),
-					time.Since(startedAt).Round(time.Millisecond),
-					err,
-				)
-				return fmt.Errorf("rpc timeout after %s: %w", active.rpcTimeout, err)
-			}
-			if err != nil {
-				log.Printf(
-					"batch get transactions failed endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s err=%v",
-					active.grpcEndpoint,
-					active.rpcHeaders["x-token"],
-					len(chunk),
-					chunkStart,
-					len(digests),
-					time.Since(startedAt).Round(time.Millisecond),
-					err,
-				)
-				return err
-			}
-			log.Printf(
-				"batch get transactions complete endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s",
-				active.grpcEndpoint,
-				active.rpcHeaders["x-token"],
-				len(chunk),
-				chunkStart,
-				len(digests),
-				time.Since(startedAt).Round(time.Millisecond),
-			)
-			if resp == nil {
-				return fmt.Errorf("batch transaction response is nil")
-			}
-			if len(resp.Transactions) != len(chunk) {
-				return fmt.Errorf("batch transaction response count mismatch: got %d want %d", len(resp.Transactions), len(chunk))
-			}
-
-			for i, result := range resp.Transactions {
-				if result == nil {
-					return fmt.Errorf("batch transaction result %d is nil", chunkStart+i)
-				}
-				if tx := result.GetTransaction(); tx != nil {
-					results[chunkStart+i] = tx
-					continue
-				}
-				if rpcErr := result.GetError(); rpcErr != nil {
-					return fmt.Errorf("batch transaction %s failed: code=%d message=%s", chunk[i], rpcErr.Code, rpcErr.Message)
-				}
-				return fmt.Errorf("batch transaction %s returned no transaction payload", chunk[i])
-			}
-			return nil
-		})
-		if err != nil {
+		if err := c.batchGetTransactionsChunk(ctx, batch.digests, batch.start, len(digests), results); err != nil {
 			return results, err
 		}
 	}
 
 	return results, nil
+}
+
+func (c *SuiClient) batchGetTransactionsChunk(
+	ctx context.Context,
+	chunk []string,
+	chunkStart int,
+	total int,
+	results []*v2.ExecutedTransaction,
+) error {
+	err := c.callWithRetryAndFallback(ctx, "BatchGetTransactions", fmt.Sprintf("%d digests", len(chunk)), func(active *SuiClient) error {
+		if err := active.acquireBatchTxSlot(ctx); err != nil {
+			return err
+		}
+		defer active.releaseBatchTxSlot()
+		if err := active.acquireGRPCSlot(ctx); err != nil {
+			return err
+		}
+		defer active.releaseGRPCSlot()
+		startedAt := time.Now()
+		log.Printf(
+			"batch get transactions start endpoint=%s token=%q digests=%d offset=%d total=%d",
+			active.grpcEndpoint,
+			active.rpcHeaders["x-token"],
+			len(chunk),
+			chunkStart,
+			total,
+		)
+
+		req := &v2.BatchGetTransactionsRequest{
+			Digests: chunk,
+			ReadMask: &fieldmaskpb.FieldMask{
+				Paths: []string{"digest", "transaction", "effects", "events", "balance_changes"},
+			},
+		}
+		if err := active.rateWait(ctx); err != nil {
+			return err
+		}
+		rpcCtx, cancel := context.WithTimeout(ctx, active.rpcTimeout)
+		defer cancel()
+		resp, err := active.grpcClient.LedgerClient().BatchGetTransactions(rpcCtx, req)
+		if err != nil && rpcCtx.Err() != nil {
+			log.Printf(
+				"batch get transactions failed endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s err=%v",
+				active.grpcEndpoint,
+				active.rpcHeaders["x-token"],
+				len(chunk),
+				chunkStart,
+				total,
+				time.Since(startedAt).Round(time.Millisecond),
+				err,
+			)
+			return fmt.Errorf("rpc timeout after %s: %w", active.rpcTimeout, err)
+		}
+		if err != nil {
+			log.Printf(
+				"batch get transactions failed endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s err=%v",
+				active.grpcEndpoint,
+				active.rpcHeaders["x-token"],
+				len(chunk),
+				chunkStart,
+				total,
+				time.Since(startedAt).Round(time.Millisecond),
+				err,
+			)
+			return err
+		}
+		log.Printf(
+			"batch get transactions complete endpoint=%s token=%q digests=%d offset=%d total=%d elapsed=%s",
+			active.grpcEndpoint,
+			active.rpcHeaders["x-token"],
+			len(chunk),
+			chunkStart,
+			total,
+			time.Since(startedAt).Round(time.Millisecond),
+		)
+		if resp == nil {
+			return fmt.Errorf("batch transaction response is nil")
+		}
+		if len(resp.Transactions) != len(chunk) {
+			return fmt.Errorf("batch transaction response count mismatch: got %d want %d", len(resp.Transactions), len(chunk))
+		}
+
+		for i, result := range resp.Transactions {
+			if result == nil {
+				return fmt.Errorf("batch transaction result %d is nil", chunkStart+i)
+			}
+			if tx := result.GetTransaction(); tx != nil {
+				results[chunkStart+i] = tx
+				continue
+			}
+			if rpcErr := result.GetError(); rpcErr != nil {
+				return fmt.Errorf("batch transaction %s failed: code=%d message=%s", chunk[i], rpcErr.Code, rpcErr.Message)
+			}
+			return fmt.Errorf("batch transaction %s returned no transaction payload", chunk[i])
+		}
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	if !isArchiveReadRowsRequestTooLargeError(err) || len(chunk) == 1 {
+		return err
+	}
+
+	mid := len(chunk) / 2
+	log.Printf(
+		"batch get transactions splitting oversized request digests=%d offset=%d total=%d err=%v",
+		len(chunk),
+		chunkStart,
+		total,
+		err,
+	)
+	if err := c.batchGetTransactionsChunk(ctx, chunk[:mid], chunkStart, total, results); err != nil {
+		return err
+	}
+	return c.batchGetTransactionsChunk(ctx, chunk[mid:], chunkStart+mid, total, results)
 }
 
 type digestChunk struct {
@@ -1133,6 +1161,9 @@ func withRetryContext(ctx context.Context, label string, fn func() error) error 
 		if lastErr == nil {
 			return nil
 		}
+		if isArchiveReadRowsRequestTooLargeError(lastErr) {
+			return lastErr
+		}
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("%s canceled: %w", label, err)
 		}
@@ -1156,4 +1187,13 @@ func isGatewayTimeoutError(err error) bool {
 	}
 	message := err.Error()
 	return strings.Contains(message, "504") && strings.Contains(message, "Gateway Timeout")
+}
+
+func isArchiveReadRowsRequestTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "Received ReadRowsRequest message too large") &&
+		strings.Contains(message, "maximum allowed: 524288")
 }

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -53,7 +54,7 @@ func TestNormalizeGRPCEndpointStripsSecureDefaultPort(t *testing.T) {
 }
 
 func TestBatchGetTransactionDigestChunksSplitsArchiveSafeBatches(t *testing.T) {
-	digests := make([]string, MaxBatchGetTransactionsDigests*2+5)
+	digests := make([]string, MaxBatchGetTransactionsDigests*2+3)
 	for i := range digests {
 		digests[i] = fmt.Sprintf("tx-%02d", i)
 	}
@@ -63,7 +64,7 @@ func TestBatchGetTransactionDigestChunksSplitsArchiveSafeBatches(t *testing.T) {
 	wantSizes := []int{
 		MaxBatchGetTransactionsDigests,
 		MaxBatchGetTransactionsDigests,
-		5,
+		3,
 	}
 	if got := len(chunks); got != len(wantSizes) {
 		t.Fatalf("chunk count = %d, want %d", got, len(wantSizes))
@@ -84,5 +85,30 @@ func TestBatchGetTransactionDigestChunksSplitsArchiveSafeBatches(t *testing.T) {
 func TestBatchGetTransactionDigestChunksEmptyInput(t *testing.T) {
 	if got := batchGetTransactionDigestChunks(nil); got != nil {
 		t.Fatalf("nil input chunks = %#v, want nil", got)
+	}
+}
+
+func TestArchiveReadRowsRequestTooLargeErrorIsDetected(t *testing.T) {
+	err := errors.New(`rpc error: code = Internal desc = code: 'Client specified an invalid argument', message: "Received ReadRowsRequest message too large (1599460, maximum allowed: 524288); Filter size 2; RowSet size 1599360"`)
+
+	if !isArchiveReadRowsRequestTooLargeError(err) {
+		t.Fatal("isArchiveReadRowsRequestTooLargeError = false, want true")
+	}
+}
+
+func TestWithRetryContextDoesNotRetryArchiveReadRowsRequestTooLarge(t *testing.T) {
+	errTooLarge := errors.New(`Received ReadRowsRequest message too large (1599460, maximum allowed: 524288)`)
+	attempts := 0
+
+	err := withRetryContext(t.Context(), "test", func() error {
+		attempts++
+		return errTooLarge
+	})
+
+	if !errors.Is(err, errTooLarge) {
+		t.Fatalf("withRetryContext error = %v, want %v", err, errTooLarge)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
 	}
 }
