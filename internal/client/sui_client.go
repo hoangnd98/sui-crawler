@@ -550,13 +550,9 @@ func (c *SuiClient) BatchGetTransactions(ctx context.Context, digests []string) 
 
 	results := make([]*v2.ExecutedTransaction, len(digests))
 
-	for start := 0; start < len(digests); start += MaxBatchGetTransactionsDigests {
-		end := start + MaxBatchGetTransactionsDigests
-		if end > len(digests) {
-			end = len(digests)
-		}
-		chunk := digests[start:end]
-		chunkStart := start
+	for _, batch := range batchGetTransactionDigestChunks(digests) {
+		chunk := batch.digests
+		chunkStart := batch.start
 
 		err := c.callWithRetryAndFallback(ctx, "BatchGetTransactions", fmt.Sprintf("%d digests", len(chunk)), func(active *SuiClient) error {
 			if err := active.acquireBatchTxSlot(ctx); err != nil {
@@ -652,6 +648,29 @@ func (c *SuiClient) BatchGetTransactions(ctx context.Context, digests []string) 
 	}
 
 	return results, nil
+}
+
+type digestChunk struct {
+	start   int
+	digests []string
+}
+
+func batchGetTransactionDigestChunks(digests []string) []digestChunk {
+	if len(digests) == 0 {
+		return nil
+	}
+	chunks := make([]digestChunk, 0, (len(digests)+MaxBatchGetTransactionsDigests-1)/MaxBatchGetTransactionsDigests)
+	for start := 0; start < len(digests); start += MaxBatchGetTransactionsDigests {
+		end := start + MaxBatchGetTransactionsDigests
+		if end > len(digests) {
+			end = len(digests)
+		}
+		chunks = append(chunks, digestChunk{
+			start:   start,
+			digests: digests[start:end],
+		})
+	}
+	return chunks
 }
 
 func checkpointTransactionDigests(contents *v2.CheckpointContents) []string {

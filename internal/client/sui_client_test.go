@@ -1,6 +1,9 @@
 package client
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestNormalizeGRPCEndpointStripsSecureDefaultPort(t *testing.T) {
 	tests := []struct {
@@ -46,5 +49,40 @@ func TestNormalizeGRPCEndpointStripsSecureDefaultPort(t *testing.T) {
 				t.Fatalf("normalizeGRPCEndpoint(%q) = %q, want %q", tt.endpoint, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBatchGetTransactionDigestChunksSplitsArchiveSafeBatches(t *testing.T) {
+	digests := make([]string, MaxBatchGetTransactionsDigests*2+5)
+	for i := range digests {
+		digests[i] = fmt.Sprintf("tx-%02d", i)
+	}
+
+	chunks := batchGetTransactionDigestChunks(digests)
+
+	wantSizes := []int{
+		MaxBatchGetTransactionsDigests,
+		MaxBatchGetTransactionsDigests,
+		5,
+	}
+	if got := len(chunks); got != len(wantSizes) {
+		t.Fatalf("chunk count = %d, want %d", got, len(wantSizes))
+	}
+	for i, wantSize := range wantSizes {
+		if got := chunks[i].start; got != i*MaxBatchGetTransactionsDigests {
+			t.Fatalf("chunk %d start = %d, want %d", i, got, i*MaxBatchGetTransactionsDigests)
+		}
+		if got := len(chunks[i].digests); got != wantSize {
+			t.Fatalf("chunk %d size = %d, want %d", i, got, wantSize)
+		}
+		if got := chunks[i].digests[0]; got != digests[chunks[i].start] {
+			t.Fatalf("chunk %d first digest = %q, want %q", i, got, digests[chunks[i].start])
+		}
+	}
+}
+
+func TestBatchGetTransactionDigestChunksEmptyInput(t *testing.T) {
+	if got := batchGetTransactionDigestChunks(nil); got != nil {
+		t.Fatalf("nil input chunks = %#v, want nil", got)
 	}
 }
