@@ -11,6 +11,7 @@ type SuiTransaction struct {
 	Status                   uint8   // 0=unknown, 1=success, 2=failure
 	KindTypename             string
 	CommandsJSON             string
+	InputsJSON               string
 	EventsJSON               string
 	BalanceChangesJSON       string
 	GasFee                   int64

@@ -6,6 +6,7 @@ CREATE TABLE default.sui_transactions (
     `status` UInt8,
     `kind_typename` String CODEC(ZSTD(6)),
     `commands_json` String,
+    `inputs_json` String,
     `events_json` String,
     `balance_changes_json` String,
     `gas_fee` Int64,

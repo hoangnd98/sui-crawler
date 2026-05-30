@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -15,7 +14,6 @@ import (
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	v2 "github.com/open-move/sui-go-sdk/proto/sui/rpc/v2"
@@ -786,37 +784,20 @@ func mapTransaction(tx *v2.ExecutedTransaction, checkpointSeqNum int64, ts time.
 	status := uint8(0)
 	kindTypename := "Unknown"
 	commandsJSON := "[]"
+	inputsJSON := "[]"
 	eventsJSON := "[]"
 	balanceChangesJSON := "[]"
 	gasFee := int64(0)
 
-	mo := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}
-
 	if tx.Transaction != nil {
-		raw, err := mo.Marshal(tx.Transaction)
-		if err == nil {
-			var txData map[string]any
-			if err := json.Unmarshal(raw, &txData); err == nil {
-				if s, ok := txData["sender"].(string); ok && s != "" {
-					sender = &s
-				}
-
-				kindTypename = extractKindTypename(txData)
-				commandsJSON = extractCommandsJSON(txData)
-
-				// Fallback to legacy JSON-RPC structure
-				if sender == nil {
-					if data, ok := txData["data"].(map[string]any); ok {
-						if s, ok := data["sender"].(string); ok && s != "" {
-							sender = &s
-						}
-					}
-				}
-			}
+		if s := tx.Transaction.GetSender(); s != "" && s != zeroSuiAddress {
+			sender = &s
 		}
+		kindTypename = transactionKindTypename(tx.Transaction)
+		commandsJSON = transactionCommandsJSON(tx.Transaction)
+		inputsJSON = transactionInputsJSON(tx.Transaction)
 	}
 
-	var effectsData map[string]any
 	if tx.Effects != nil {
 		if tx.Effects.Status != nil && tx.Effects.Status.Success != nil {
 			if *tx.Effects.Status.Success {
@@ -843,16 +824,10 @@ func mapTransaction(tx *v2.ExecutedTransaction, checkpointSeqNum int64, ts time.
 				gasFee = 0
 			}
 		}
-
-		raw, err := mo.Marshal(tx.Effects)
-		if err == nil {
-			_ = json.Unmarshal(raw, &effectsData)
-		}
 	}
 
-	balanceChangesJSON = extractBalanceChangesJSON(tx.BalanceChanges)
-
-	eventsJSON = extractEventsJSON(tx.Events)
+	balanceChangesJSON = transactionBalanceChangesJSON(tx.BalanceChanges)
+	eventsJSON = transactionEventsJSON(tx.Events)
 
 	parsedTx := models.SuiTransaction{
 		Digest:                   txDigest,
@@ -862,246 +837,19 @@ func mapTransaction(tx *v2.ExecutedTransaction, checkpointSeqNum int64, ts time.
 		Status:                   status,
 		KindTypename:             kindTypename,
 		CommandsJSON:             commandsJSON,
+		InputsJSON:               inputsJSON,
 		EventsJSON:               eventsJSON,
 		BalanceChangesJSON:       balanceChangesJSON,
 		GasFee:                   gasFee,
 	}
 
-	txObjs := extractTransactionObjects(txDigest, ts, effectsData)
+	var changedObjects []*v2.ChangedObject
+	if tx.Effects != nil {
+		changedObjects = tx.Effects.ChangedObjects
+	}
+	txObjs := transactionObjectsFromChanges(txDigest, ts, changedObjects)
 
 	return parsedTx, txObjs, nil
-}
-
-// extractKindTypename returns the transaction kind typename from the transaction JSON.
-func extractKindTypename(txData map[string]any) string {
-	switch v := txData["kind"].(type) {
-	case string:
-		return v
-	case map[string]any:
-		if k, ok := v["kind"].(string); ok {
-			return k
-		}
-		// Use the first key as typename if there's a oneOf structure
-		for key := range v {
-			return snakeToPascal(key) + "Transaction"
-		}
-	}
-	return "Unknown"
-}
-
-// extractCommandsJSON builds a minimal classification-ready JSON array from the transaction kind.
-func extractCommandsJSON(txData map[string]any) string {
-	// Navigate to commands: kind.programmable_transaction.commands
-	kindVal, ok := txData["kind"].(map[string]any)
-	if !ok {
-		return "[]"
-	}
-	ptVal, ok := kindVal["programmable_transaction"].(map[string]any)
-	if !ok {
-		return "[]"
-	}
-	cmdsRaw, ok := ptVal["commands"].([]any)
-	if !ok {
-		return "[]"
-	}
-
-	result := make([]map[string]any, 0, len(cmdsRaw))
-	for _, c := range cmdsRaw {
-		cmdMap, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		entry := mapCommand(cmdMap)
-		result = append(result, entry)
-	}
-
-	b, err := json.Marshal(result)
-	if err != nil {
-		return "[]"
-	}
-	return string(b)
-}
-
-func mapCommand(cmd map[string]any) map[string]any {
-	for key, val := range cmd {
-		entry := map[string]any{"__typename": snakeToPascal(key) + "Command"}
-
-		inner, _ := val.(map[string]any)
-
-		switch key {
-		case "move_call":
-			if inner != nil {
-				if fn, ok := inner["function"].(string); ok {
-					entry["function_name"] = fn
-				}
-				if pkg, ok := inner["package"].(string); ok {
-					entry["package_address"] = pkg
-				}
-			}
-		case "transfer_objects":
-			if inner != nil {
-				if inputs, ok := inner["objects"]; ok {
-					entry["transfer_inputs"] = inputs
-				}
-				if addr, ok := inner["address"]; ok {
-					entry["transfer_address"] = addr
-				}
-			}
-		}
-		return entry
-	}
-	return map[string]any{"__typename": "UnknownCommand"}
-}
-
-// extractEventsJSON serialises events as [{type, json}] for storage.
-func extractEventsJSON(events *v2.TransactionEvents) string {
-	if events == nil || len(events.Events) == 0 {
-		return "[]"
-	}
-
-	result := make([]map[string]any, 0, len(events.Events))
-	for _, evt := range events.Events {
-		entry := map[string]any{}
-		if evt.EventType != nil {
-			entry["type"] = *evt.EventType
-		}
-		if evt.Json != nil {
-			raw, err := evt.Json.MarshalJSON()
-			if err == nil {
-				var parsed any
-				if err := json.Unmarshal(raw, &parsed); err == nil {
-					entry["json"] = parsed
-				}
-			}
-		}
-		result = append(result, entry)
-	}
-
-	b, err := json.Marshal(result)
-	if err != nil {
-		return "[]"
-	}
-	return string(b)
-}
-
-// extractBalanceChangesJSON builds [{coin_type, amount, owner_address}] from gRPC balance changes.
-func extractBalanceChangesJSON(balanceChanges []*v2.BalanceChange) string {
-	if len(balanceChanges) == 0 {
-		return "[]"
-	}
-
-	result := make([]map[string]any, 0, len(balanceChanges))
-	for _, change := range balanceChanges {
-		if change == nil {
-			continue
-		}
-		entry := map[string]any{
-			"coin_type":     change.GetCoinType(),
-			"amount":        change.GetAmount(),
-			"owner_address": nil,
-		}
-		if change.Address != nil {
-			entry["owner_address"] = change.GetAddress()
-		}
-		result = append(result, entry)
-	}
-
-	b, err := json.Marshal(result)
-	if err != nil {
-		return "[]"
-	}
-	return string(b)
-}
-
-// extractTransactionObjects parses changed_objects from effects JSON into SuiTransactionObject rows.
-func extractTransactionObjects(txDigest string, ts time.Time, effectsData map[string]any) []models.SuiTransactionObject {
-	if effectsData == nil {
-		return nil
-	}
-	raw, ok := effectsData["changed_objects"].([]any)
-	if !ok {
-		return nil
-	}
-
-	var result []models.SuiTransactionObject
-	for _, item := range raw {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		objectID := stringOrEmpty(m["object_id"])
-
-		inputVersion := parseUint64(m["input_version"])
-		outputVersion := parseUint64(m["output_version"])
-
-		// Determine canonical version (prefer output)
-		version := outputVersion
-		if version == 0 {
-			version = inputVersion
-		}
-
-		// Skip read-only objects
-		if version == 0 {
-			continue
-		}
-
-		// Skip unchanged objects (same digest in both states)
-		inputDigestStr := stringOrEmpty(m["input_digest"])
-		outputDigestStr := stringOrEmpty(m["output_digest"])
-		if inputDigestStr != "" && outputDigestStr != "" && inputDigestStr == outputDigestStr {
-			continue
-		}
-
-		idOperation := stringOrEmpty(m["id_operation"])
-		isCreated := uint8(0)
-		isDeleted := uint8(0)
-		if idOperation == "Created" {
-			isCreated = 1
-		} else if idOperation == "Deleted" || idOperation == "Wrapped" {
-			isDeleted = 1
-		}
-
-		obj := models.SuiTransactionObject{
-			ObjectID:          objectID,
-			Version:           version,
-			TransactionDigest: txDigest,
-			InputVersion:      inputVersion,
-			InputOwner:        nullableString(ownerAddress(m["input_owner"])),
-			InputDigest:       nullableString(inputDigestStr),
-			OutputVersion:     outputVersion,
-			OutputOwner:       nullableString(ownerAddress(m["output_owner"])),
-			OutputDigest:      nullableString(outputDigestStr),
-			IsCreated:         isCreated,
-			IsDeleted:         isDeleted,
-			Timestamp:         ts,
-		}
-		result = append(result, obj)
-	}
-
-	return result
-}
-
-// ownerAddress extracts the owner address string from an owner map.
-func ownerAddress(owner any) string {
-	if owner == nil {
-		return ""
-	}
-	switch v := owner.(type) {
-	case string:
-		return v
-	case map[string]any:
-		if addr, ok := v["address"].(string); ok {
-			return addr
-		}
-		if objID, ok := v["object_id"].(string); ok {
-			return objID
-		}
-		if kind, ok := v["kind"].(string); ok {
-			return kind
-		}
-	}
-	return ""
 }
 
 func nullableString(s string) *string {
@@ -1109,36 +857,6 @@ func nullableString(s string) *string {
 		return nil
 	}
 	return &s
-}
-
-func stringOrEmpty(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
-}
-
-func parseUint64(v any) uint64 {
-	switch n := v.(type) {
-	case float64:
-		return uint64(n)
-	case string:
-		var u uint64
-		fmt.Sscanf(n, "%d", &u)
-		return u
-	}
-	return 0
-}
-
-// snakeToPascal converts "move_call" → "MoveCall".
-func snakeToPascal(s string) string {
-	parts := strings.Split(s, "_")
-	for i, p := range parts {
-		if len(p) > 0 {
-			parts[i] = strings.ToUpper(p[:1]) + p[1:]
-		}
-	}
-	return strings.Join(parts, "")
 }
 
 func withRetry(label string, fn func() error) error {

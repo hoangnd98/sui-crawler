@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS sui_transactions
     gas_non_refundable_storage_fee  String,
     status                          String,
     transaction_kind                String,
+    inputs_json                     String,
     raw_transaction                 String,
     raw_effects                     String
 )

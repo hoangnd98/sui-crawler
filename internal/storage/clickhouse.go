@@ -31,7 +31,7 @@ const insertCheckpointsQuery = `INSERT INTO sui_checkpoints (
 const insertTransactionsQuery = `INSERT INTO sui_transactions (
 		digest, checkpoint_sequence_number, timestamp,
 		sender, status, kind_typename,
-		commands_json, events_json, balance_changes_json, gas_fee
+		commands_json, inputs_json, events_json, balance_changes_json, gas_fee
 	)`
 
 const insertTransactionObjectsQuery = `INSERT INTO sui_transaction_objects (
@@ -210,7 +210,7 @@ func (s *ClickHouseStorage) insertTransactionBatch(ctx context.Context, rows []m
 		if err := batch.Append(
 			r.Digest, r.CheckpointSequenceNumber, r.Timestamp,
 			r.Sender, r.Status, r.KindTypename,
-			r.CommandsJSON, r.EventsJSON, r.BalanceChangesJSON, r.GasFee,
+			r.CommandsJSON, r.InputsJSON, r.EventsJSON, r.BalanceChangesJSON, r.GasFee,
 		); err != nil {
 			return fmt.Errorf("append transaction row: %w", err)
 		}

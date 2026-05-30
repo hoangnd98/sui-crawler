@@ -4,6 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
+
+	v2 "github.com/open-move/sui-go-sdk/proto/sui/rpc/v2"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func TestNormalizeGRPCEndpointStripsSecureDefaultPort(t *testing.T) {
@@ -147,4 +151,167 @@ func TestGRPCMessageSizeLimitIsAboveDefault(t *testing.T) {
 	if maxGRPCMessageSize <= defaultGRPCMessageSize {
 		t.Fatalf("maxGRPCMessageSize = %d, want > %d", maxGRPCMessageSize, defaultGRPCMessageSize)
 	}
+}
+
+func TestMapTransactionNormalizesGrpcFieldsLikeGraphQLMapper(t *testing.T) {
+	tx := parityFixtureTransaction("tx-digest", "0xsender")
+
+	row, objects, err := mapTransaction(tx, 100, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("mapTransaction returned error: %v", err)
+	}
+
+	if row.Sender == nil || *row.Sender != "0xsender" {
+		t.Fatalf("sender = %v, want 0xsender", row.Sender)
+	}
+	if row.KindTypename != "ProgrammableTransaction" {
+		t.Fatalf("kind = %q, want ProgrammableTransaction", row.KindTypename)
+	}
+	if row.CommandsJSON != `[{"__typename":"MoveCallCommand","function_name":"swap","package_address":"0xpkg"},{"__typename":"MakeMoveVecCommand"},{"__typename":"TransferObjectsCommand","transfer_address":{"__typename":"Input","ix":2},"transfer_inputs":[{"__typename":"GasCoin"},{"__typename":"TxResult","cmd":1}]}]` {
+		t.Fatalf("commands_json = %s", row.CommandsJSON)
+	}
+	if row.InputsJSON != `[{"__typename":"MoveValue"},{"__typename":"SharedInput","address":"0xshared","mutable":true},{"__typename":"OwnedOrImmutable","object_address":"0xowned"}]` {
+		t.Fatalf("inputs_json = %s", row.InputsJSON)
+	}
+	if row.EventsJSON != `[{"json":{"a":1},"type":"eventA"},{"json":{"b":2},"type":"eventB"}]` {
+		t.Fatalf("events_json = %s", row.EventsJSON)
+	}
+	if row.BalanceChangesJSON != `[{"amount":"1","coin_type":"coinA","owner_address":"0x1"},{"amount":"2","coin_type":"coinB","owner_address":"0x2"}]` {
+		t.Fatalf("balance_changes_json = %s", row.BalanceChangesJSON)
+	}
+	if row.GasFee != 2500 {
+		t.Fatalf("gas_fee = %d, want 2500", row.GasFee)
+	}
+	if len(objects) != 1 {
+		t.Fatalf("transaction objects = %d, want 1", len(objects))
+	}
+	if objects[0].InputOwner != nil {
+		t.Fatalf("input owner = %v, want nil for shared owner", *objects[0].InputOwner)
+	}
+	if objects[0].OutputOwner == nil || *objects[0].OutputOwner != "0xowner" {
+		t.Fatalf("output owner = %v, want 0xowner", objects[0].OutputOwner)
+	}
+}
+
+func TestMapTransactionNormalizesZeroSenderProgrammableAsSystem(t *testing.T) {
+	tx := parityFixtureTransaction("system-tx", zeroSuiAddress)
+
+	row, _, err := mapTransaction(tx, 100, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("mapTransaction returned error: %v", err)
+	}
+
+	if row.Sender != nil {
+		t.Fatalf("sender = %v, want nil", *row.Sender)
+	}
+	if row.KindTypename != "ProgrammableSystemTransaction" {
+		t.Fatalf("kind = %q, want ProgrammableSystemTransaction", row.KindTypename)
+	}
+	if row.CommandsJSON != "[]" {
+		t.Fatalf("commands_json = %s, want []", row.CommandsJSON)
+	}
+	if row.InputsJSON != "[]" {
+		t.Fatalf("inputs_json = %s, want []", row.InputsJSON)
+	}
+}
+
+func parityFixtureTransaction(digest, sender string) *v2.ExecutedTransaction {
+	argGasKind := v2.Argument_GAS
+	argInputKind := v2.Argument_INPUT
+	argResultKind := v2.Argument_RESULT
+	inputPureKind := v2.Input_PURE
+	inputSharedKind := v2.Input_SHARED
+	inputOwnedKind := v2.Input_IMMUTABLE_OR_OWNED
+	inputExists := v2.ChangedObject_INPUT_OBJECT_STATE_EXISTS
+	outputWrite := v2.ChangedObject_OUTPUT_OBJECT_STATE_OBJECT_WRITE
+	idNone := v2.ChangedObject_NONE
+	ownerShared := v2.Owner_SHARED
+	ownerAddress := v2.Owner_ADDRESS
+	success := true
+
+	eventA, err := structpb.NewStruct(map[string]any{"a": 1})
+	if err != nil {
+		panic(err)
+	}
+	eventB, err := structpb.NewStruct(map[string]any{"b": 2})
+	if err != nil {
+		panic(err)
+	}
+
+	return &v2.ExecutedTransaction{
+		Digest: ptr(digest),
+		Transaction: &v2.Transaction{
+			Sender: ptr(sender),
+			Kind: &v2.TransactionKind{
+				Data: &v2.TransactionKind_ProgrammableTransaction{
+					ProgrammableTransaction: &v2.ProgrammableTransaction{
+						Commands: []*v2.Command{
+							{
+								Command: &v2.Command_MoveCall{
+									MoveCall: &v2.MoveCall{
+										Package:  ptr("0xpkg"),
+										Module:   ptr("amm"),
+										Function: ptr("swap"),
+									},
+								},
+							},
+							{Command: &v2.Command_MakeMoveVector{MakeMoveVector: &v2.MakeMoveVector{}}},
+							{
+								Command: &v2.Command_TransferObjects{
+									TransferObjects: &v2.TransferObjects{
+										Objects: []*v2.Argument{
+											{Kind: &argGasKind},
+											{Kind: &argResultKind, Result: ptr(uint32(1))},
+										},
+										Address: &v2.Argument{Kind: &argInputKind, Input: ptr(uint32(2))},
+									},
+								},
+							},
+						},
+						Inputs: []*v2.Input{
+							{Kind: &inputPureKind, Pure: []byte{1, 2, 3}},
+							{Kind: &inputSharedKind, ObjectId: ptr("0xshared"), Mutable: ptr(true)},
+							{Kind: &inputOwnedKind, ObjectId: ptr("0xowned")},
+						},
+					},
+				},
+			},
+		},
+		Effects: &v2.TransactionEffects{
+			Status: &v2.ExecutionStatus{Success: &success},
+			GasUsed: &v2.GasCostSummary{
+				ComputationCost: ptr(uint64(1000)),
+				StorageCost:     ptr(uint64(2000)),
+				StorageRebate:   ptr(uint64(500)),
+			},
+			ChangedObjects: []*v2.ChangedObject{
+				{
+					ObjectId:      ptr("0xobject"),
+					InputState:    &inputExists,
+					InputVersion:  ptr(uint64(1)),
+					InputDigest:   ptr("inDigest"),
+					InputOwner:    &v2.Owner{Kind: &ownerShared, Version: ptr(uint64(1))},
+					OutputState:   &outputWrite,
+					OutputVersion: ptr(uint64(2)),
+					OutputDigest:  ptr("outDigest"),
+					OutputOwner:   &v2.Owner{Kind: &ownerAddress, Address: ptr("0xowner")},
+					IdOperation:   &idNone,
+				},
+			},
+		},
+		Events: &v2.TransactionEvents{
+			Events: []*v2.Event{
+				{EventType: ptr("eventB"), Json: structpb.NewStructValue(eventB)},
+				{EventType: ptr("eventA"), Json: structpb.NewStructValue(eventA)},
+			},
+		},
+		BalanceChanges: []*v2.BalanceChange{
+			{Address: ptr("0x2"), CoinType: ptr("coinB"), Amount: ptr("2")},
+			{Address: ptr("0x1"), CoinType: ptr("coinA"), Amount: ptr("1")},
+		},
+	}
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }
