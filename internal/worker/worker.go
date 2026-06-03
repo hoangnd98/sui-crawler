@@ -96,6 +96,11 @@ func (w *Worker) processJob(ctx context.Context, assignment models.JobAssignment
 	defer suiClient.Close()
 	suiClient.SetRPCTimeout(w.cfg.RPCTimeout)
 
+	// Collects transactions the archive can only hydrate with a reduced read
+	// mask, so they can be associated with their checkpoint and persisted.
+	degraded := newDegradedRegistry()
+	suiClient.SetDegradedTransactionSink(degraded.record)
+
 	chStorage, err := storage.NewClickHouseStorage(
 		w.cfg.CHAddr, w.cfg.CHDatabase, w.cfg.CHUsername, w.cfg.CHPassword,
 	)
@@ -109,7 +114,7 @@ func (w *Worker) processJob(ctx context.Context, assignment models.JobAssignment
 	}
 	defer chStorage.Close()
 
-	err = w.processBatchesSequential(ctx, suiClient, chStorage, job, startCheckpoint, job.EndCheckpoint)
+	err = w.processBatchesSequential(ctx, suiClient, chStorage, job, startCheckpoint, job.EndCheckpoint, degraded)
 	if err != nil {
 		w.sendReport(models.JobReport{
 			JobID: job.ID,
@@ -136,6 +141,7 @@ func (w *Worker) processBatchesSequential(
 	job *models.CrawlerJob,
 	startPos int64,
 	endPos int64,
+	degraded *degradedRegistry,
 ) error {
 	chunkSize := int64(processingChunkSize)
 	fetchConcurrency := w.checkpointFetchConcurrency()
@@ -156,7 +162,7 @@ func (w *Worker) processBatchesSequential(
 		log.Printf("[%s] Job %s — chunk [%d -> %d] fetch_parallelism=%d tx_parallelism=%d",
 			w.id, job.ID.Hex(), batchStart, batchEnd, fetchConcurrency, hydrationConcurrency)
 
-		if err := w.processCheckpointRange(ctx, suiClient, chStorage, job.ID, batchStart, batchEnd, fetchConcurrency, hydrationConcurrency); err != nil {
+		if err := w.processCheckpointRange(ctx, suiClient, chStorage, job.ID, batchStart, batchEnd, fetchConcurrency, hydrationConcurrency, degraded); err != nil {
 			return fmt.Errorf("chunk [%d-%d]: %w", batchStart, batchEnd, err)
 		}
 	}
@@ -172,6 +178,7 @@ func (w *Worker) processCheckpointRange(
 	from, to int64,
 	checkpointConcurrency int,
 	hydrationConcurrency int,
+	degraded *degradedRegistry,
 ) error {
 	pipelineCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -298,6 +305,7 @@ func (w *Worker) processCheckpointRange(
 					fail(err)
 					return
 				}
+				w.persistDegradedTransactions(pipelineCtx, jobID, batch.items, degraded)
 				for _, result := range results {
 					select {
 					case checkpointResultCh <- result:

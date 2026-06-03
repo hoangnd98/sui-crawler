@@ -16,4 +16,7 @@ type WorkerConfig struct {
 	CHPassword  string
 	RateLimiter *rate.Limiter
 	RPCTimeout  time.Duration
+	// DegradedRecorder persists transactions the archive cannot fully hydrate.
+	// Optional; nil disables degraded-transaction recording.
+	DegradedRecorder DegradedTransactionRecorder
 }

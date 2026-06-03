@@ -62,6 +62,7 @@ func main() {
 
 	db := mongoClient.Database(cfg.MongoDB)
 	jobRepo := repository.NewJobRepository(db)
+	degradedRepo := repository.NewDegradedTransactionRepository(db)
 
 	// Create a shared SuiClient for the API (no rate limiter; read-only, low-frequency calls).
 	apiSuiClient, err := client.NewSuiClient(ctx, cfg.SuiRPCURL, nil)
@@ -107,6 +108,8 @@ func main() {
 		CHUsername:  cfg.ClickHouseUsername,
 		CHPassword:  cfg.ClickHousePassword,
 		RateLimiter: limiter,
+
+		DegradedRecorder: degradedRepo,
 	}
 
 	const workerID = "crawler-worker"

@@ -47,6 +47,7 @@ type SuiClient struct {
 	rpcHeaders             map[string]string
 	jsonRPCURL             string
 	gatewayTimeoutFallback *SuiClient
+	degradedSink           DegradedTransactionSink
 }
 
 // NewSuiClient creates a new SUI gRPC client. limiter may be nil (no rate limiting).
@@ -294,7 +295,7 @@ func (c *SuiClient) callWithRetryAndFallback(
 	if err == nil {
 		return nil
 	}
-	if isAdaptiveBatchSplitError(err) {
+	if isAdaptiveBatchSplitError(err) || isUnparseableTypeError(err) {
 		return err
 	}
 
@@ -664,22 +665,32 @@ func (c *SuiClient) batchGetTransactionsChunk(
 	if err == nil {
 		return nil
 	}
-	if !isAdaptiveBatchSplitError(err) || len(chunk) == 1 {
-		return err
+
+	// Both oversized-request errors and deterministic malformed-type item errors
+	// are isolated by splitting the chunk down to the offending digest.
+	splittable := isAdaptiveBatchSplitError(err) || isUnparseableTypeError(err)
+	if splittable && len(chunk) > 1 {
+		mid := len(chunk) / 2
+		log.Printf(
+			"batch get transactions splitting request digests=%d offset=%d total=%d err=%v",
+			len(chunk),
+			chunkStart,
+			total,
+			err,
+		)
+		if err := c.batchGetTransactionsChunk(ctx, chunk[:mid], chunkStart, total, results); err != nil {
+			return err
+		}
+		return c.batchGetTransactionsChunk(ctx, chunk[mid:], chunkStart+mid, total, results)
 	}
 
-	mid := len(chunk) / 2
-	log.Printf(
-		"batch get transactions splitting oversized request digests=%d offset=%d total=%d err=%v",
-		len(chunk),
-		chunkStart,
-		total,
-		err,
-	)
-	if err := c.batchGetTransactionsChunk(ctx, chunk[:mid], chunkStart, total, results); err != nil {
-		return err
+	// Single offending digest the archive cannot render: degrade to a reduced
+	// read mask so the rest of the pipeline keeps making progress.
+	if isUnparseableTypeError(err) {
+		return c.degradeUnparseableTransaction(ctx, chunk[0], chunkStart, results, err)
 	}
-	return c.batchGetTransactionsChunk(ctx, chunk[mid:], chunkStart+mid, total, results)
+
+	return err
 }
 
 type digestChunk struct {
@@ -885,7 +896,7 @@ func withRetryContext(ctx context.Context, label string, fn func() error) error 
 		if lastErr == nil {
 			return nil
 		}
-		if isAdaptiveBatchSplitError(lastErr) {
+		if isAdaptiveBatchSplitError(lastErr) || isUnparseableTypeError(lastErr) {
 			return lastErr
 		}
 		if err := ctx.Err(); err != nil {
