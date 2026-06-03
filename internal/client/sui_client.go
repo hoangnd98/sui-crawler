@@ -656,7 +656,7 @@ func (c *SuiClient) batchGetTransactionsChunk(
 				continue
 			}
 			if rpcErr := result.GetError(); rpcErr != nil {
-				return fmt.Errorf("batch transaction %s failed: code=%d message=%s", chunk[i], rpcErr.Code, rpcErr.Message)
+				return newBatchTransactionError(chunk[i], rpcErr.Code, rpcErr.Message)
 			}
 			return fmt.Errorf("batch transaction %s returned no transaction payload", chunk[i])
 		}
@@ -666,13 +666,17 @@ func (c *SuiClient) batchGetTransactionsChunk(
 		return nil
 	}
 
-	// Both oversized-request errors and deterministic malformed-type item errors
-	// are isolated by splitting the chunk down to the offending digest.
-	splittable := isAdaptiveBatchSplitError(err) || isUnparseableTypeError(err)
-	if splittable && len(chunk) > 1 {
+	// Deterministic malformed-type item errors name the exact offending digest,
+	// so isolate it directly instead of repeatedly halving the chunk.
+	if isUnparseableTypeError(err) {
+		return c.isolateUnparseableTransaction(ctx, chunk, chunkStart, total, results, err)
+	}
+
+	// Oversized-request errors carry no per-digest detail; halve the chunk.
+	if isAdaptiveBatchSplitError(err) && len(chunk) > 1 {
 		mid := len(chunk) / 2
 		log.Printf(
-			"batch get transactions splitting request digests=%d offset=%d total=%d err=%v",
+			"batch get transactions splitting oversized request digests=%d offset=%d total=%d err=%v",
 			len(chunk),
 			chunkStart,
 			total,
@@ -682,12 +686,6 @@ func (c *SuiClient) batchGetTransactionsChunk(
 			return err
 		}
 		return c.batchGetTransactionsChunk(ctx, chunk[mid:], chunkStart+mid, total, results)
-	}
-
-	// Single offending digest the archive cannot render: degrade to a reduced
-	// read mask so the rest of the pipeline keeps making progress.
-	if isUnparseableTypeError(err) {
-		return c.degradeUnparseableTransaction(ctx, chunk[0], chunkStart, results, err)
 	}
 
 	return err

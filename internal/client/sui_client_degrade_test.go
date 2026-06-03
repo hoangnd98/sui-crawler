@@ -50,6 +50,39 @@ func TestIsUnparseableTypeError(t *testing.T) {
 	}
 }
 
+func TestBatchTransactionErrorIsUnparseable(t *testing.T) {
+	err := newBatchTransactionError("digestX", 13, `unable to parse type "LPCoin<0x5c45"`)
+	if !isUnparseableTypeError(err) {
+		t.Fatal("typed batch error with parse message should be unparseable")
+	}
+	if got, want := err.Error(), `batch transaction digestX failed: code=13 message=unable to parse type "LPCoin<0x5c45"`; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+
+	notParse := newBatchTransactionError("digestY", 5, "object not found")
+	if isUnparseableTypeError(notParse) {
+		t.Fatal("typed batch error without parse message should not be unparseable")
+	}
+}
+
+func TestUnparseableDigestIndex(t *testing.T) {
+	chunk := []string{"a", "b", "poison", "d"}
+	err := newBatchTransactionError("poison", 13, `unable to parse type "X"`)
+	if got := unparseableDigestIndex(chunk, err); got != 2 {
+		t.Fatalf("unparseableDigestIndex = %d, want 2", got)
+	}
+
+	// Digest not in chunk -> -1.
+	if got := unparseableDigestIndex(chunk, newBatchTransactionError("missing", 13, "unable to parse type")); got != -1 {
+		t.Fatalf("unparseableDigestIndex(missing) = %d, want -1", got)
+	}
+
+	// Untyped error -> -1 (caller falls back to halving).
+	if got := unparseableDigestIndex(chunk, errors.New("unable to parse type")); got != -1 {
+		t.Fatalf("unparseableDigestIndex(untyped) = %d, want -1", got)
+	}
+}
+
 // TestWithRetryContextSkipsUnparseableTypeError verifies the deterministic
 // malformed-type error is returned on the first attempt without burning retries.
 func TestWithRetryContextSkipsUnparseableTypeError(t *testing.T) {

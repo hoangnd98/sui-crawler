@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -9,6 +10,27 @@ import (
 	v2 "github.com/open-move/sui-go-sdk/proto/sui/rpc/v2"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 )
+
+// batchTransactionError is the per-item error a BatchGetTransactions response
+// carries for a single digest. Keeping it typed lets the caller isolate the
+// exact offending digest instead of parsing log strings or halving the batch.
+type batchTransactionError struct {
+	digest  string
+	code    int32
+	message string
+}
+
+func newBatchTransactionError(digest string, code int32, message string) error {
+	return &batchTransactionError{digest: digest, code: code, message: message}
+}
+
+func (e *batchTransactionError) Error() string {
+	return fmt.Sprintf("batch transaction %s failed: code=%d message=%s", e.digest, e.code, e.message)
+}
+
+func (e *batchTransactionError) unparseableType() bool {
+	return strings.Contains(e.message, "unable to parse type")
+}
 
 // degradedReadMaskPaths is the reduced read mask used when the archive cannot
 // render a transaction body. It omits the `transaction` field (the source of
@@ -38,7 +60,75 @@ func isUnparseableTypeError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var bte *batchTransactionError
+	if errors.As(err, &bte) && bte.unparseableType() {
+		return true
+	}
 	return strings.Contains(err.Error(), "unable to parse type")
+}
+
+// isolateUnparseableTransaction handles a chunk that failed because one digest
+// has an unrenderable transaction body. The archive error names the offending
+// digest, so it is degraded in place and the surrounding good digests are
+// re-fetched as batches (which recurse if they hold further malformed digests).
+// If the digest cannot be identified, it falls back to halving the chunk.
+func (c *SuiClient) isolateUnparseableTransaction(
+	ctx context.Context,
+	chunk []string,
+	chunkStart int,
+	total int,
+	results []*v2.ExecutedTransaction,
+	err error,
+) error {
+	idx := unparseableDigestIndex(chunk, err)
+	if idx < 0 {
+		if len(chunk) > 1 {
+			mid := len(chunk) / 2
+			log.Printf(
+				"batch get transactions isolating malformed transaction via split digests=%d offset=%d total=%d",
+				len(chunk), chunkStart, total,
+			)
+			if e := c.batchGetTransactionsChunk(ctx, chunk[:mid], chunkStart, total, results); e != nil {
+				return e
+			}
+			return c.batchGetTransactionsChunk(ctx, chunk[mid:], chunkStart+mid, total, results)
+		}
+		return c.degradeUnparseableTransaction(ctx, chunk[0], chunkStart, results, err)
+	}
+
+	log.Printf(
+		"batch get transactions isolating malformed transaction digest=%s offset=%d total=%d",
+		chunk[idx], chunkStart+idx, total,
+	)
+	if e := c.degradeUnparseableTransaction(ctx, chunk[idx], chunkStart+idx, results, err); e != nil {
+		return e
+	}
+	if idx > 0 {
+		if e := c.batchGetTransactionsChunk(ctx, chunk[:idx], chunkStart, total, results); e != nil {
+			return e
+		}
+	}
+	if idx+1 < len(chunk) {
+		if e := c.batchGetTransactionsChunk(ctx, chunk[idx+1:], chunkStart+idx+1, total, results); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// unparseableDigestIndex returns the position in chunk of the digest named by a
+// typed batch item error, or -1 if it cannot be determined.
+func unparseableDigestIndex(chunk []string, err error) int {
+	var bte *batchTransactionError
+	if !errors.As(err, &bte) {
+		return -1
+	}
+	for i, digest := range chunk {
+		if digest == bte.digest {
+			return i
+		}
+	}
+	return -1
 }
 
 // degradeUnparseableTransaction handles a single digest whose body the archive
